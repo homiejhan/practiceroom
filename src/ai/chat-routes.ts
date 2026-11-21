@@ -35,6 +35,7 @@ import {
 } from 'deepspace/worker'
 import type { AgentToolAccessResult, AgentToolRouteOptions, ChatTurn } from 'deepspace/worker'
 import { schemas } from '../schemas.js'
+import { spendAiCall } from '../server/ai-usage.js'
 import { buildSystemPrompt } from './tools.js'
 // Type-only — TypeScript strips these at runtime, so no circular import
 // with worker.ts (which imports `registerAiChatRoutes` from this file).
@@ -186,6 +187,12 @@ export function registerAiChatRoutes(
       return c.json({ error: 'Chat not found' }, 404)
     }
 
+    // Practice Room bills the tutor's assistant to the app owner (see the
+    // `authToken` notes below), so each turn counts against the same per-user
+    // daily allowance as question generation and grading.
+    const overLimit = await spendAiCall(c.env, auth.userId)
+    if (overLimit) return c.json({ error: overLimit, code: 'daily_limit' }, 429)
+
     // Load history before writing this turn. `persistTurn` later writes user then
     // assistant as separate DO operations; the ordering is intentional, but
     // it is not atomic.
@@ -220,8 +227,9 @@ export function registerAiChatRoutes(
         ? { text: chat.compactedSummary, throughId: chat.compactedThroughId }
         : undefined
 
-    // User-billed: compaction is part of the user's chat experience, not infra.
-    const summarizer = makeDefaultSummarizer(c.env, { authToken: jwt })
+    // Owner-billed (no authToken), like the turn itself: a tutor needs no
+    // DeepSpace credits of their own. The daily allowance above is the limit.
+    const summarizer = makeDefaultSummarizer(c.env)
     const { messages: prepared, newSummary } = await prepareMessagesWithCompaction(
       turns,
       DEFAULT_CONTEXT_CONFIG,
@@ -351,7 +359,11 @@ export function registerAiChatRoutes(
     const { result } = streamDeepSpaceAgent(c.env, {
       profile: 'application',
       modelId: usedModelId,
-      authToken: jwt,
+      // The platform reserves credits for the largest reply a request could
+      // produce before it runs. The SDK default (64k tokens) reserves more
+      // than a small credit balance holds, so the turn is refused outright;
+      // a tutoring answer never needs that much room.
+      maxOutputTokens: 6000,
       instructions: systemText,
       messages,
       tools,

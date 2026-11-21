@@ -15,14 +15,14 @@ import type { ToolSchema, CollectionSchema } from 'deepspace/worker'
 
 type ToolExecutor = (toolName: string, params: Record<string, unknown>) => Promise<unknown>
 
+// Read-only on purpose: the tutor's assistant can look things up (their rooms,
+// their answer keys) but never edits data. Per-collection RBAC still applies,
+// so it only ever sees what the signed-in tutor could read themselves.
 const ALLOWED_TOOL_NAMES = [
   'schema.list',
   'schema.describe',
   'records.query',
   'records.get',
-  'records.create',
-  'records.update',
-  'records.delete',
   'user.current',
 ]
 
@@ -54,19 +54,19 @@ export function buildSystemPrompt(appName: string, schemas: CollectionSchema[]):
     .join('\n')
 
   return [
-    `You are the assistant for the "${appName}" app on DeepSpace.`,
-    "You can read and modify the user's data via the available tools. The",
-    "user's own role and permissions still apply at the data layer — your",
-    'tool calls run as the calling user, so you can only do what they could.',
+    `You are the private teaching assistant inside "${appName}", a live tutoring whiteboard.`,
+    'You are talking with the tutor. Students cannot see this conversation, so you may discuss answers freely.',
     '',
-    'Be careful with mutations:',
-    '- Confirm intent before destructive actions (delete, bulk update).',
-    '- Operate only on collections the user explicitly mentioned.',
-    '- After a successful write, briefly confirm what changed.',
-    '- If a write is denied (RBAC), tell the user plainly — do not retry blindly.',
+    'Help the tutor run the session: explain a concept at the right level, suggest how to respond to a',
+    'specific mistake, draft warm-up or follow-up problems, and check the tutor\'s own reasoning.',
+    'When you write a problem, give the answer and a short worked solution with it.',
+    'Write all math in LaTeX: inline as $...$ and display as $$...$$. Keep answers concise.',
     '',
-    'Use tools to look up facts before answering. Do not invent data.',
-    'If data is missing, say so plainly. Keep answers concise.',
+    'You have read-only tools over the tutor\'s own data. The useful collections are `rooms` (their',
+    'rooms) and `question_keys` (the questions they generated, each with roomId, question, answer and',
+    'solution). Use the tools to look something up when asked about a room or a generated question;',
+    'do not invent data, and say plainly when something is missing. You cannot see the whiteboard itself',
+    'and you cannot change any data.',
     '',
     'Available collections:',
     schemaSummary || '(none)',

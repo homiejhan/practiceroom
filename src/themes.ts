@@ -23,6 +23,11 @@ export const THEMES = [
     description: 'Neutral dark placeholder default. Replace with your own theme.',
   },
   {
+    id: 'studio',
+    label: 'Studio',
+    description: 'Practice Room: warm paper chrome, ink text, one deep green accent.',
+  },
+  {
     id: 'paper',
     label: 'Paper',
     description: 'Light example theme showing the token contract. Replace or delete.',

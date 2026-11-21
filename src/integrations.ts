@@ -26,5 +26,9 @@ export const integrations: Record<
 > = {
   google: { billing: 'user' },
   composio: { billing: 'user' },
+  // Question generation and grading run in server actions and are billed to
+  // the app owner, so a tutor needs no credits of their own. Sign-in is still
+  // required, and src/actions/index.ts caps calls per user per day.
+  anthropic: { billing: 'developer' },
   // openai: { billing: 'developer', anonymous: true },
 }

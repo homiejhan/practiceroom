@@ -10,6 +10,7 @@
 import type { Context, Hono } from 'hono'
 import { authenticatedRoomRequest, resolveAppRole, verifyJwt } from 'deepspace/worker'
 import type { JwtVerifierConfig, VerifyResult } from 'deepspace/worker'
+import { readGuestPass } from './guest.js'
 import type { AppContext, Env } from '../../worker.js'
 
 function jwtConfig(env: Env): JwtVerifierConfig {
@@ -40,6 +41,40 @@ function wsRoute(
     const namespace = doNamespace(c.env)
     const stub = namespace.get(namespace.idFromName(id))
     return stub.fetch(roomRequest)
+  }
+}
+
+/**
+ * WebSocket route for the per-room whiteboard and presence rooms.
+ *
+ * Identity comes from exactly two places, both verified here at the edge: the
+ * caller's JWT, or the HMAC-signed guest pass a student received when they
+ * joined this room by name (see guest.ts). A pass is bound to one room id, so
+ * it grants nothing on any other room's sockets.
+ */
+function roomSocketRoute(doNamespace: (env: Env) => DurableObjectNamespace) {
+  return async (c: Context<AppContext>) => {
+    const id = c.req.param('docId') ?? c.req.param('scopeId')
+    if (!id) return new Response('Not found', { status: 404 })
+    const token = new URL(c.req.url).searchParams.get('token')
+
+    let identity: { userId: string; claims: { name?: string } } | null = null
+    if (token) {
+      const auth = (await verifyJwt(jwtConfig(c.env), token)).result
+      if (!auth) return new Response('Unauthorized', { status: 401 })
+      identity = auth
+    } else {
+      const pass = await readGuestPass(c.req.raw, c.env, id)
+      if (pass) identity = { userId: pass.guestId, claims: { name: pass.name } }
+    }
+
+    const roomRequest = authenticatedRoomRequest(
+      c.req.raw,
+      identity,
+      identity ? { role: 'member' } : undefined,
+    )
+    const namespace = doNamespace(c.env)
+    return namespace.get(namespace.idFromName(id)).fetch(roomRequest)
   }
 }
 
@@ -142,17 +177,17 @@ export function registerRealtimeRoutes(app: Hono<AppContext>): void {
     return stub.fetch(roomRequest)
   })
 
+  // A room's whiteboard and its cursors share the room id. Signed-in users
+  // and students holding a guest pass for this room both write; anyone else
+  // is forwarded with no identity, which CanvasRoom treats as a read-only viewer.
   app.get(
     '/ws/canvas/:docId',
-    wsRoute(
-      (env) => env.CANVAS_ROOMS,
-      async (auth, env) => ({ role: await resolveAppRole(env, auth.userId) }),
-    ),
+    roomSocketRoute((env) => env.CANVAS_ROOMS),
   )
 
   app.get(
     '/ws/presence/:scopeId',
-    wsRoute((env) => env.PRESENCE_ROOMS),
+    roomSocketRoute((env) => env.PRESENCE_ROOMS),
   )
 
   app.get(

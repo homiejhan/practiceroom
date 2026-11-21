@@ -16,23 +16,26 @@
  */
 
 import { Suspense, type ReactNode } from 'react'
-import { Outlet } from 'react-router-dom'
+import { Outlet, useLocation } from 'react-router-dom'
 import { DeepSpaceAuthProvider, useAuthStatus } from 'deepspace'
 import { RecordProvider, RecordScope, AgentTools } from 'deepspace'
 import Navigation from '../../components/Navigation'
 import { useToast } from '@/components/ui'
-import { APP_NAME, SCOPE_ID } from '../../constants'
+import { APP_DISPLAY_NAME, SCOPE_ID } from '../../constants'
 import { schemas } from '../../schemas'
 
 export default function AppLayout() {
+  // A room is a full-screen workspace with its own header (and students have
+  // no account menu to show), so the app navigation stays out of it.
+  const inRoom = useLocation().pathname.startsWith('/r/')
   return (
     <DeepSpaceAuthProvider>
       {/* The prerendered landing owns the document <title> and React drops it
           when <Seo> unmounts, so every route without <Seo> sets its own. */}
-      <title>{APP_NAME}</title>
+      <title>{APP_DISPLAY_NAME}</title>
       <AuthBoot>
         <div className="flex h-screen flex-col bg-background overflow-hidden">
-          <Navigation />
+          {!inRoom && <Navigation />}
           <main className="flex-1 overflow-y-auto min-h-0">
             <Suspense fallback={<div className="flex items-center justify-center h-full text-muted-foreground">Loading...</div>}>
               <Outlet />

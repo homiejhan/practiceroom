@@ -44,3 +44,33 @@
   --color-shell: #fafafa;
   --color-shell-panel: #ffffff;
 }
+
+/* Studio — Practice Room's theme: warm paper chrome around a white board,
+ * near-black ink for text, one deep green accent (the "correct" marker). */
+[data-theme="studio"] {
+  color-scheme: light;
+  --color-background: #f5f4ef;
+  --color-foreground: #1b1c1f;
+  --color-card: #ffffff;
+  --color-card-foreground: #1b1c1f;
+  --color-popover: #ffffff;
+  --color-popover-foreground: #1b1c1f;
+  --color-primary: #0f6b5c;
+  --color-primary-foreground: #ffffff;
+  --color-secondary: #ebe9e2;
+  --color-secondary-foreground: #1b1c1f;
+  --color-muted: #ebe9e2;
+  --color-muted-foreground: #5d6067;
+  --color-accent: #e3e0d7;
+  --color-accent-foreground: #1b1c1f;
+  --color-destructive: #b42318;
+  --color-destructive-foreground: #ffffff;
+  --color-border: #d9d6cc;
+  --color-input: #cfccc1;
+  --color-ring: #0f6b5c;
+  --radius: 0.5rem;
+  --shadow-card: 0 1px 2px 0 rgba(27, 28, 31, 0.06);
+  --shadow-card-hover: 0 4px 14px 0 rgba(27, 28, 31, 0.1);
+  --color-shell: #f5f4ef;
+  --color-shell-panel: #ffffff;
+}

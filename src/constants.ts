@@ -1,6 +1,9 @@
 /** App name — replaced by the CLI during scaffolding */
 export const APP_NAME = 'practiceroom'
 
+/** Human-readable product name shown in the UI. */
+export const APP_DISPLAY_NAME = 'Practice Room'
+
 /** Immutable app identity — data scope keys to this, so renames never
  *  strand your records.
  *
