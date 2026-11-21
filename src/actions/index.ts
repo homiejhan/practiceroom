@@ -25,9 +25,11 @@ import {
   type RegionQuestion,
   type RegionTyped,
 } from '../server/ai.js'
-import { spendAiCall } from '../server/ai-usage.js'
+import { appFiles } from 'deepspace/worker'
+import { spendAiCall, spendRecapEmail } from '../server/ai-usage.js'
 import { ROOM_ID_RE } from '../server/guest.js'
 import { recordTools } from '../server/record-tools.js'
+import { buildRecapEmail, buildWorksheetLatex } from '../server/worksheet.js'
 import type { Env } from '../../worker.js'
 
 const fail = (error: string): ActionResult<never> => ({ success: false, error })
@@ -92,6 +94,105 @@ const asCoordinate = (value: unknown): number =>
 
 const MAX_IMAGE_CHARS = 4_000_000
 const PNG_PREFIX = 'data:image/png;base64,'
+
+const EMAIL_RE = /^[^\s@<>,;]+@[^\s@<>,;]+\.[^\s@<>,;]+$/
+
+// A type alias, not an interface: the tools API wants an index-signature-compatible shape.
+type QuestionKeyData = {
+  roomId: string
+  title: string
+  question: string
+  answer: string
+  solution?: string
+}
+
+interface Worksheet {
+  /** Path the app serves the PDF at, relative to its origin. */
+  path: string
+  questionTitles: string[]
+  tutorName: string
+  tutorEmail: string
+}
+
+/**
+ * Typeset a room's questions as a PDF and store it in the app's files.
+ *
+ * App-scope files are readable by anyone who has the URL, which is what lets
+ * a student open the link from an email without an account. The key carries a
+ * random id, so the URL is not guessable from the room id.
+ */
+async function makeWorksheet(
+  context: { userId: string; tools: ActionTools; env: Env },
+  room: { roomId: string; title: string },
+  options: { includeAnswers: boolean; date: string },
+): Promise<{ ok: true; worksheet: Worksheet } | { ok: false; error: string }> {
+  const { userId, tools, env } = context
+  const found = await tools.query<QuestionKeyData>('question_keys', {
+    where: { roomId: room.roomId },
+    orderBy: 'createdAt',
+    orderDir: 'asc',
+    limit: 40,
+  })
+  const keys = found.success ? found.data.records : []
+  if (!keys.length) return { ok: false, error: 'Create at least one question first.' }
+
+  const profile = await getRecord<{ name?: string; email?: string }>(tools, 'users', userId)
+  const tutorName = profile?.data.name?.trim() || 'Your tutor'
+
+  const document = buildWorksheetLatex({
+    roomTitle: room.title,
+    tutorName,
+    date: options.date,
+    includeAnswers: options.includeAnswers,
+    questions: keys.map((key) => ({
+      title: key.data.title,
+      question: key.data.question,
+      answer: key.data.answer,
+      solution: key.data.solution ?? '',
+    })),
+  })
+
+  const compiled = await tools.integration<{ compiled?: boolean; pdfBase64?: string | null; error?: string }>(
+    'latex-compiler/compile',
+    { compiler: 'pdflatex', document },
+  )
+  if (!compiled.success) return { ok: false, error: compiled.error ?? 'The PDF service did not respond.' }
+  if (!compiled.data.compiled || !compiled.data.pdfBase64) {
+    // A failed compile is a normal response, not a transport error; keep the
+    // reason in the logs and give the tutor something they can act on.
+    console.error(`[worksheet] compile failed room=${room.roomId}: ${compiled.data.error ?? 'no reason given'}`)
+    return {
+      ok: false,
+      error: 'The worksheet could not be typeset. One of the questions may contain notation LaTeX cannot print.',
+    }
+  }
+
+  const bytes = Uint8Array.from(atob(compiled.data.pdfBase64), (ch) => ch.charCodeAt(0))
+  try {
+    const file = await appFiles(env, { scope: 'app', userId }).upload(
+      new Blob([bytes], { type: 'application/pdf' }),
+      { key: `worksheets/${room.roomId}/${crypto.randomUUID()}.pdf`, name: 'worksheet.pdf' },
+    )
+    return {
+      ok: true,
+      worksheet: {
+        path: file.path,
+        questionTitles: keys.map((key) => key.data.title),
+        tutorName,
+        tutorEmail: profile?.data.email?.trim() ?? '',
+      },
+    }
+  } catch (error) {
+    console.error(`[worksheet] upload failed room=${room.roomId}: ${String(error)}`)
+    return { ok: false, error: 'The worksheet was created but could not be saved.' }
+  }
+}
+
+/** A short display date from the tutor's browser, or today's UTC date. */
+function worksheetDate(raw: unknown): string {
+  if (typeof raw === 'string' && /^[\w ,./-]{4,40}$/.test(raw)) return raw
+  return new Date().toISOString().slice(0, 10)
+}
 
 export const actions: Record<string, ActionHandler<Env>> = {
   /** Create a room owned by the caller. The id is the secret part of the join link. */
@@ -266,5 +367,65 @@ export const actions: Record<string, ActionHandler<Env>> = {
     )
     if (!posted.success) return fail('Claude finished, but the result could not be posted to the chat.')
     return { success: true, data: { messageId: posted.data.recordId } }
+  },
+
+  /** Typeset the room's questions as a printable PDF and return its link. */
+  createWorksheet: async ({ userId, params, tools, env }) => {
+    const room = await ownedRoom(tools, params.roomId, userId)
+    if (!room) return fail('Only the tutor of this room can make a worksheet.')
+    const overLimit = await spendAiCall(env, userId)
+    if (overLimit) return fail(overLimit)
+
+    const made = await makeWorksheet(
+      { userId, tools, env },
+      room,
+      { includeAnswers: params.includeAnswers === true, date: worksheetDate(params.date) },
+    )
+    if (!made.ok) return fail(made.error)
+    return { success: true, data: { path: made.worksheet.path } }
+  },
+
+  /**
+   * Email a session recap with a link to the worksheet PDF. The recipient is
+   * whatever address the tutor types, so the message is a fixed template and
+   * sends are capped per tutor per day.
+   */
+  sendRecap: async ({ userId, params, tools, env }) => {
+    const room = await ownedRoom(tools, params.roomId, userId)
+    if (!room) return fail('Only the tutor of this room can send a recap.')
+
+    const to = typeof params.to === 'string' ? params.to.trim() : ''
+    if (to.length > 254 || !EMAIL_RE.test(to)) return fail('Enter one valid email address.')
+    const includeAnswers = params.includeAnswers === true
+
+    const overLimit = await spendRecapEmail(env, userId)
+    if (overLimit) return fail(overLimit)
+
+    const made = await makeWorksheet(
+      { userId, tools, env },
+      room,
+      { includeAnswers, date: worksheetDate(params.date) },
+    )
+    if (!made.ok) return fail(made.error)
+
+    const { worksheet } = made
+    const email = buildRecapEmail({
+      roomTitle: room.title,
+      tutorName: worksheet.tutorName,
+      questionTitles: worksheet.questionTitles,
+      // The link has to work from an inbox, so it uses the app's public origin.
+      worksheetUrl: `https://${env.APP_NAME}.app.space${worksheet.path}`,
+      includeAnswers,
+    })
+    const sent = await tools.integration('email/send', {
+      to,
+      subject: email.subject,
+      text: email.text,
+      html: email.html,
+      // The platform sends from its own address; replies should reach the tutor.
+      ...(worksheet.tutorEmail ? { reply_to: worksheet.tutorEmail } : {}),
+    })
+    if (!sent.success) return fail(sent.error ?? 'The email could not be sent.')
+    return { success: true, data: { to, path: worksheet.path } }
   },
 }

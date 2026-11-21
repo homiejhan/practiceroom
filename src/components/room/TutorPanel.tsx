@@ -1,7 +1,8 @@
 /**
  * Tutor-only side panel: create questions (describe one, or browse
- * subject → topic → question type), read the private answer keys, and talk
- * to Claude in a chat only the tutor can see.
+ * subject → topic → question type), read the private answer keys, send the
+ * session home as a worksheet PDF and recap email, and talk to Claude in a
+ * chat only the tutor can see.
  */
 
 import { useEffect, useMemo, useState } from 'react'
@@ -9,7 +10,17 @@ import { useQuery } from 'deepspace'
 import { LoaderCircle } from 'lucide-react'
 import { ChatPanel } from '@/components/ChatPanel'
 import { Markdown } from '@/components/Markdown'
-import { Button, Label, Tabs, TabsContent, TabsList, TabsTrigger, Textarea, useToast } from '@/components/ui'
+import {
+  Button,
+  Input,
+  Label,
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+  Textarea,
+  useToast,
+} from '@/components/ui'
 import { callAction } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import type { CatalogSubject } from '@/catalog'
@@ -62,7 +73,7 @@ export function TutorPanel({ roomId, userId, onQuestion }: TutorPanelProps) {
     <Tabs defaultValue="create" className="flex h-full min-h-0 flex-col gap-0">
       <TabsList className="mx-3 mt-3 grid w-auto grid-cols-3">
         <TabsTrigger value="create">Questions</TabsTrigger>
-        <TabsTrigger value="keys">Answer keys</TabsTrigger>
+        <TabsTrigger value="keys">Session</TabsTrigger>
         <TabsTrigger value="claude">Ask Claude</TabsTrigger>
       </TabsList>
       <TabsContent value="create" keepMounted className="min-h-0 flex-1 overflow-y-auto px-3 pb-4">
@@ -402,16 +413,21 @@ function AnswerKeys({ roomId }: { roomId: string }) {
     orderDir: 'asc',
   })
 
-  if (status === 'loading') return <p className="pt-3 text-sm text-muted-foreground">Loading answer keys</p>
+  if (status === 'loading') return <p className="pt-3 text-sm text-muted-foreground">Loading the session</p>
   if (!records.length) {
     return (
       <p className="pt-3 text-sm text-muted-foreground">
-        Answer keys for the questions you create appear here. Only you can see them.
+        The questions you create appear here with their answer keys, which only you can see. From
+        here you can also send them home as a worksheet.
       </p>
     )
   }
 
   return (
+    <>
+    <RecapCard roomId={roomId} />
+    <h2 className="mt-5 text-sm font-semibold">Answer keys</h2>
+    <p className="text-xs text-muted-foreground">Only you can see these.</p>
     <ol className="space-y-3 pt-3">
       {records.map((record, index) => (
         <li key={record.recordId} className="rounded-md border border-border bg-card p-3">
@@ -431,5 +447,131 @@ function AnswerKeys({ roomId }: { roomId: string }) {
         </li>
       ))}
     </ol>
+    </>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Send the session home: worksheet PDF and recap email
+// ---------------------------------------------------------------------------
+
+const EMAIL_SHAPE = /^[^\s@<>,;]+@[^\s@<>,;]+\.[^\s@<>,;]+$/
+
+function RecapCard({ roomId }: { roomId: string }) {
+  const toast = useToast()
+  const [includeAnswers, setIncludeAnswers] = useState(false)
+  const [email, setEmail] = useState('')
+  const [busy, setBusy] = useState<'pdf' | 'email' | null>(null)
+  const [worksheetPath, setWorksheetPath] = useState<string | null>(null)
+
+  // The printed date is the tutor's local date, not the server's.
+  const today = () => new Intl.DateTimeFormat('en-US', { dateStyle: 'long' }).format(new Date())
+
+  const makeWorksheet = async () => {
+    if (busy) return
+    setBusy('pdf')
+    const result = await callAction<{ path: string }>('createWorksheet', {
+      roomId,
+      includeAnswers,
+      date: today(),
+    })
+    setBusy(null)
+    if (!result.ok) {
+      toast.error('No worksheet created', result.error)
+      return
+    }
+    setWorksheetPath(result.data.path)
+  }
+
+  const sendRecap = async () => {
+    const to = email.trim()
+    if (busy || !EMAIL_SHAPE.test(to)) return
+    setBusy('email')
+    const result = await callAction<{ to: string; path: string }>('sendRecap', {
+      roomId,
+      to,
+      includeAnswers,
+      date: today(),
+    })
+    setBusy(null)
+    if (!result.ok) {
+      toast.error('The recap was not sent', result.error)
+      return
+    }
+    setWorksheetPath(result.data.path)
+    setEmail('')
+    toast.success('Recap sent', `Emailed to ${result.data.to}`)
+  }
+
+  return (
+    <section className="mt-3 space-y-3 rounded-md border border-border bg-card p-3" aria-labelledby="recap-heading">
+      <div>
+        <h2 id="recap-heading" className="text-sm font-semibold">
+          Send the session home
+        </h2>
+        <p className="text-xs text-muted-foreground">
+          A printable worksheet of these questions, typeset as a PDF.
+        </p>
+      </div>
+
+      <label className="flex items-start gap-2 text-sm">
+        <input
+          type="checkbox"
+          className="mt-0.5 accent-[var(--color-primary)]"
+          checked={includeAnswers}
+          onChange={(event) => {
+            setIncludeAnswers(event.target.checked)
+            // A worksheet made with the other setting is no longer what the link shows.
+            setWorksheetPath(null)
+          }}
+        />
+        Include answers and worked solutions
+      </label>
+
+      <div className="flex flex-wrap items-center gap-3">
+        <Button type="button" variant="outline" size="sm" disabled={busy !== null} onClick={makeWorksheet}>
+          {busy === 'pdf' && <LoaderCircle className="size-4 animate-spin" aria-hidden="true" />}
+          {busy === 'pdf' ? 'Typesetting' : 'Make worksheet PDF'}
+        </Button>
+        {worksheetPath && (
+          <a
+            href={worksheetPath}
+            target="_blank"
+            rel="noreferrer"
+            className="text-sm font-medium text-primary underline-offset-4 hover:underline"
+          >
+            Open worksheet
+          </a>
+        )}
+      </div>
+
+      <form
+        className="space-y-1.5 border-t border-border pt-3"
+        onSubmit={(event) => {
+          event.preventDefault()
+          void sendRecap()
+        }}
+      >
+        <Label htmlFor="recap-email">Email the recap to</Label>
+        <div className="flex gap-2">
+          <Input
+            id="recap-email"
+            type="email"
+            value={email}
+            onChange={(event) => setEmail(event.target.value)}
+            maxLength={254}
+            placeholder="student or parent email"
+            autoComplete="off"
+          />
+          <Button type="submit" size="sm" className="h-10" disabled={busy !== null || !EMAIL_SHAPE.test(email.trim())}>
+            {busy === 'email' && <LoaderCircle className="size-4 animate-spin" aria-hidden="true" />}
+            {busy === 'email' ? 'Sending' : 'Send'}
+          </Button>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          A short note with the list of questions and a link to the worksheet. Replies go to you.
+        </p>
+      </form>
+    </section>
   )
 }

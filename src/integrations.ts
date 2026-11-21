@@ -30,5 +30,8 @@ export const integrations: Record<
   // the app owner, so a tutor needs no credits of their own. Sign-in is still
   // required, and src/actions/index.ts caps calls per user per day.
   anthropic: { billing: 'developer' },
+  // Worksheet PDFs and recap emails, same policy and the same daily caps.
+  'latex-compiler': { billing: 'developer' },
+  email: { billing: 'developer' },
   // openai: { billing: 'developer', anonymous: true },
 }

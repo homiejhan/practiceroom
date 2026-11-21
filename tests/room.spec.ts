@@ -215,8 +215,8 @@ test('the tutor creates a question and Claude grades the boxed region', async ({
   await shot(tutor.page, 'tutor-question')
 
   // The private key reaches the tutor's panel and never the student's page.
-  await tutor.page.getByRole('tab', { name: 'Answer keys' }).click()
-  await expect(tutor.page.getByText('Worked solution')).toBeVisible({ timeout: 15_000 })
+  await tutor.page.getByRole('tab', { name: 'Session' }).click()
+  await expect(tutor.page.getByText('Worked solution', { exact: true })).toBeVisible({ timeout: 15_000 })
   expect(await student.content()).not.toContain('Worked solution')
 
   // The student types a wrong answer just under the question card.
@@ -276,6 +276,33 @@ test('the tutor creates a question and Claude grades the boxed region', async ({
   await expect(conversation.locator('.katex').first()).toBeVisible({ timeout: 120_000 })
   await shot(tutor.page, 'tutor-assistant')
   expect(await student.content()).not.toContain('vertex form')
+
+  // Send the session home: the questions are typeset as a PDF that opens
+  // without an account (the student's context has none), and the recap email
+  // goes out. delivered@resend.dev is the mail provider's own test inbox, so
+  // no real person is emailed.
+  await tutor.page.getByRole('tab', { name: 'Session' }).click()
+  await tutor.page.getByRole('button', { name: 'Make worksheet PDF' }).click()
+  const worksheetLink = tutor.page.getByRole('link', { name: 'Open worksheet' })
+  await expect(worksheetLink).toBeVisible({ timeout: 90_000 })
+  const worksheetPath = await worksheetLink.getAttribute('href')
+  const worksheet = await student.request.get(worksheetPath!)
+  expect(worksheet.status()).toBe(200)
+  expect(worksheet.headers()['content-type']).toContain('application/pdf')
+  expect((await worksheet.body()).subarray(0, 5).toString()).toBe('%PDF-')
+
+  await tutor.page.getByLabel('Email the recap to').fill('delivered@resend.dev')
+  await tutor.page.getByRole('button', { name: 'Send', exact: true }).click()
+  await expect(tutor.page.getByText('Recap sent')).toBeVisible({ timeout: 90_000 })
+  await shot(tutor.page, 'tutor-recap')
+
+  // A student cannot ask for a check, a worksheet or a recap.
+  for (const action of ['createWorksheet', 'sendRecap']) {
+    const refused = await student.request.post(`/api/actions/${action}`, {
+      data: { roomId, to: 'someone@example.com' },
+    })
+    expect(refused.status()).toBe(401)
+  }
 
   // A student cannot ask for a check, even for their own room.
   const studentCheck = await student.request.post('/api/actions/checkRegion', {

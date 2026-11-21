@@ -25,6 +25,8 @@ explanation to the room chat.
 - **Room chat** for everyone, with LaTeX rendering. Claude posts there only when the tutor checks a
   region.
 - **A private Claude chat** for the tutor, which students cannot see.
+- **Send the session home** (tutor only): the room's questions typeset as a printable PDF
+  worksheet, with or without the worked solutions, and a recap email that links to it.
 
 ## How it is built
 
@@ -36,10 +38,13 @@ explanation to the room chat.
 | Room chat | `RecordRoom`, one scope per room (`room:<id>`) | `src/components/room/RoomChat.tsx` |
 | Create room, generate question, grade region | Server actions | `src/actions/index.ts` |
 | Claude calls | `anthropic/chat-completion` through the integration proxy | `src/server/ai.ts` |
+| Worksheet PDF | `latex-compiler/compile` integration, stored with `appFiles` | `src/server/worksheet.ts` |
+| Recap email | `email/send` integration | `src/actions/index.ts` |
 | Tutor's private assistant | The `ai-chat` feature (`ChatPanel` + `streamDeepSpaceAgent`) | `src/components/room/TutorPanel.tsx` |
 | Signing key for guest passes | The app's secrets store (`GUEST_SECRET`) | `src/server/guest.ts` |
 
-There is no API key in the repository or in the app: every Claude call goes through DeepSpace.
+There is no API key in the repository or in the app: Claude, the LaTeX compiler and email all go
+through DeepSpace's integration proxy.
 
 ### Students have no account, so the worker gives them an identity
 
@@ -71,12 +76,22 @@ and appears in the image only as a labelled placeholder, which is more reliable 
 vision model to re-read rendered math. The worker attaches the private answer keys, calls Claude,
 and posts the result to the room chat.
 
-### Who pays for AI
+### The worksheet and the recap email
 
-Question generation, grading and the tutor's assistant are billed to the app owner, so a tutor
-needs no credits. Sign-in is required for all three, and every call counts against a per-user
-daily allowance (`src/server/ai-usage.ts`). Reply sizes are capped because the platform reserves
-credits for the largest possible reply before a call runs.
+Questions are stored as Markdown with `$...$` math, which is what the board and chat render. A
+printed worksheet needs real LaTeX, so `src/server/worksheet.ts` converts the small Markdown
+subset Claude is told to write and escapes everything else, then `latex-compiler/compile` typesets
+it. The PDF is stored in the app's files under a random key and the email links to it, because
+`email/send` has no attachments. The email itself is a fixed template with the question titles;
+the math stays in the PDF, where it is typeset properly. Replies go to the tutor.
+
+### Who pays
+
+Question generation, grading, the tutor's assistant, worksheets and recap emails are billed to the
+app owner, so a tutor needs no credits. Sign-in is required for all of them, and every call counts
+against a per-user daily allowance (`src/server/ai-usage.ts`). Recap emails have their own smaller
+allowance (10 a day), because they go to an address the tutor types. Reply sizes are capped
+because the platform reserves credits for the largest possible reply before a call runs.
 
 ## Run it
 
@@ -103,7 +118,9 @@ RUN_AI_TESTS=1 npx deepspace test run tests/room.spec.ts           # adds real C
 against the real workers. The free test covers joining by name, ink in both directions,
 highlighter, select/move/delete/undo, cursor names, typed fractions, chat, and the server
 boundaries (no pass, wrong room, forged cookie, student calling a tutor action). The opt-in test
-creates a question both ways, grades a boxed wrong answer, and uses the tutor's private chat.
+creates a question both ways, grades a boxed wrong answer, uses the tutor's private chat, makes a
+worksheet PDF and opens it without an account, and sends a recap to the mail provider's test
+inbox. `src/server/worksheet.test.ts` unit-tests the Markdown-to-LaTeX conversion.
 
 ## Tradeoffs and limits
 
@@ -120,10 +137,14 @@ creates a question both ways, grades a boxed wrong answer, and uses the tutor's 
   be misread, and the prompt asks Claude to say so when it is unsure.
 - **Deleting a room removes its record** (the link stops working) but does not clear that room's
   board or chat storage.
-- **One integration, used three ways.** Only `anthropic/chat-completion` is on the main path
-  (question types, question writing, vision grading). Email and PDF export were left out because
-  the session happens live on the board; a recap email with a worksheet PDF is the next thing I
-  would add.
+- **A worksheet link is public to anyone who has it.** App-scope files are world-readable, which
+  is what lets a student open the PDF from an email with no account. The key is random, but a
+  worksheet made with the answers included should only be sent to someone who should see them.
+- **A recap can be sent to any address the tutor types.** The message is a fixed template and
+  sends are capped per tutor per day, so the app is not a general way to email strangers, but
+  there is no confirmation step from the recipient.
+- **The recap does not include Claude's grading results**, only the questions and, optionally,
+  the worked solutions from the answer keys.
 
 ## Where the subject list comes from
 
