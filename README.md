@@ -14,6 +14,8 @@ explanation to the room chat.
 
 - **Shared whiteboard** with five tools: move around, select, type math, pen (nine colors), and
   highlighter (six neon colors). Plus undo/redo and zoom.
+- **Stylus hardware**: a pen's eraser end erases ink and its side button selects, under whichever
+  tool is active. Flip the pen back over and it carries on with that tool.
 - **Math typing that behaves like Desmos**: `/` makes a fraction, `^` an exponent, `sqrt` a
   radical, `pi` a π. Entries are stored as LaTeX.
 - **Live cursors with names**, for everyone in the room.
@@ -117,7 +119,9 @@ RUN_AI_TESTS=1 npx deepspace test run tests/room.spec.ts           # adds real C
 `tests/room.spec.ts` drives a signed-in tutor and a name-only student in two browser contexts
 against the real workers. The free test covers joining by name, ink in both directions,
 highlighter, select/move/delete/undo, cursor names, typed fractions, chat, and the server
-boundaries (no pass, wrong room, forged cookie, student calling a tutor action). The opt-in test
+boundaries (no pass, wrong room, forged cookie, student calling a tutor action). A second free
+test sends the Pointer Events a stylus would (eraser end, side button) and checks erasing, undo,
+selecting and moving on both screens. The opt-in test
 creates a question both ways, grades a boxed wrong answer, uses the tutor's private chat, makes a
 worksheet PDF and opens it without an account, and sends a recap to the mail provider's test
 inbox. `src/server/worksheet.test.ts` unit-tests the Markdown-to-LaTeX conversion.
@@ -131,6 +135,10 @@ inbox. `src/server/worksheet.test.ts` unit-tests the Markdown-to-LaTeX conversio
   access, so a student can move or delete anyone's ink. Question cards are locked to the tutor in
   the UI only.
 - **Ink appears to others when a stroke ends**, not while it is being drawn.
+- **Pen controls are the ones a browser can see.** The eraser end and the side button arrive as
+  Pointer Events (`src/board/penInput.ts`). A Surface pen's top-button click and an Apple Pencil's
+  double-tap go to the operating system, not to web pages. The eraser removes whole strokes, and
+  only ink: typed math and question cards are removed with Select and Delete.
 - **Edits are last-write-wins per shape**, which is how `CanvasRoom` merges. Two people dragging
   the same stroke at once will see one of them win.
 - **Grading depends on reading handwriting from an image.** Typed answers are exact; messy ink can

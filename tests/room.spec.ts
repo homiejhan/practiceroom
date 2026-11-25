@@ -193,6 +193,124 @@ test('a student joins by name and the board, cursors and chat sync both ways', a
   await strangerContext.close()
 })
 
+/**
+ * Send the Pointer Events a stylus would. A pen reports its hardware controls
+ * in `button`/`buttons`: 5/32 for the eraser end, 2/2 for the side button.
+ * Each event gets its own frame, as it would from real hardware.
+ */
+async function penGesture(
+  page: Page,
+  control: 'tip' | 'eraser' | 'side',
+  points: Array<[number, number]>,
+  { release = true }: { release?: boolean } = {},
+): Promise<void> {
+  await page.getByTestId('board').evaluate(
+    async (board, { control, points, release }) => {
+      const [button, buttons] = control === 'eraser' ? [5, 32] : control === 'side' ? [2, 2] : [0, 1]
+      const frame = () => new Promise((resolve) => requestAnimationFrame(resolve))
+      const fire = (type: string, point: [number, number]) =>
+        board.dispatchEvent(
+          new PointerEvent(type, {
+            bubbles: true,
+            cancelable: true,
+            pointerId: 41,
+            pointerType: 'pen',
+            isPrimary: true,
+            clientX: point[0],
+            clientY: point[1],
+            button: type === 'pointermove' ? -1 : button,
+            buttons: type === 'pointerup' ? 0 : buttons,
+            pressure: type === 'pointerup' ? 0 : 0.5,
+          }),
+        )
+      fire('pointerdown', points[0])
+      for (const point of points.slice(1)) {
+        await frame()
+        fire('pointermove', point)
+      }
+      await frame()
+      if (release) fire('pointerup', points[points.length - 1])
+    },
+    { control, points, release },
+  )
+}
+
+test("a pen's eraser end erases and its side button selects, under any tool", async ({
+  users,
+  browser,
+}) => {
+  test.setTimeout(90_000)
+  const [tutor] = await users(1)
+  const roomPath = await createRoom(tutor.page, 'Pen hardware')
+  const studentContext = await browser.newContext()
+  const student = await studentContext.newPage()
+  await joinAsStudent(student, roomPath, 'Maya')
+
+  const box = await boardBox(tutor.page)
+  const at = (x: number, y: number): [number, number] => [box.x + x, box.y + y]
+  const penTool = tutor.page.locator('[data-tool="pen"]')
+  const selectedInk = tutor.page.locator('.board-stroke-selected')
+  const allPaths = (page: Page) =>
+    inkPaths(page).evaluateAll((paths) => paths.map((p) => p.getAttribute('d')).sort().join('|'))
+
+  // Two strokes with the pen tool, which stays selected throughout.
+  await drawLine(tutor.page, ...at(240, 200), ...at(420, 200))
+  await drawLine(tutor.page, ...at(240, 340), ...at(420, 340))
+  await expect(inkPaths(student)).toHaveCount(2, { timeout: 10_000 })
+  await expect(penTool).toHaveAttribute('aria-pressed', 'true')
+
+  // The eraser end swept across the first stroke removes it for everyone,
+  // and draws nothing even though the pen tool is the one selected.
+  await penGesture(tutor.page, 'eraser', [at(330, 150), at(330, 200), at(330, 260)])
+  await expect(inkPaths(tutor.page)).toHaveCount(1)
+  await expect(inkPaths(student)).toHaveCount(1, { timeout: 10_000 })
+  await expect(tutor.page.locator('.board-eraser')).toBeHidden()
+  await expect(penTool).toHaveAttribute('aria-pressed', 'true')
+
+  // A sweep over empty board erases nothing. While the eraser is down, its
+  // outline sits under it; lifting it hides the outline.
+  await penGesture(tutor.page, 'eraser', [at(600, 100), at(640, 140)], { release: false })
+  const ring = await tutor.page.locator('.board-eraser').boundingBox()
+  expect(Math.abs(ring!.x + ring!.width / 2 - (box.x + 640))).toBeLessThan(2)
+  expect(Math.abs(ring!.y + ring!.height / 2 - (box.y + 140))).toBeLessThan(2)
+  await shot(tutor.page, 'pen-eraser-down')
+  await penGesture(tutor.page, 'eraser', [at(640, 140)])
+  await expect(tutor.page.locator('.board-eraser')).toBeHidden()
+  await expect(inkPaths(tutor.page)).toHaveCount(1)
+
+  // Erasing is an ordinary delete, so undo brings the ink back on both boards.
+  await tutor.page.keyboard.press('ControlOrMeta+z')
+  await expect(inkPaths(tutor.page)).toHaveCount(2, { timeout: 10_000 })
+  await expect(inkPaths(student)).toHaveCount(2, { timeout: 10_000 })
+
+  // The side button taps to select without leaving the pen tool...
+  await penGesture(tutor.page, 'side', [at(330, 352)])
+  await expect(selectedInk).toHaveCount(1)
+  await expect(penTool).toHaveAttribute('aria-pressed', 'true')
+
+  // ...and drags to move what it selected; the student's copy follows.
+  const before = await allPaths(student)
+  await penGesture(tutor.page, 'side', [at(330, 352), at(350, 372), at(380, 400)])
+  await expect.poll(() => allPaths(student), { timeout: 10_000 }).not.toBe(before)
+  expect(await allPaths(tutor.page)).toBe(await allPaths(student))
+  await expect(inkPaths(student)).toHaveCount(2)
+
+  // Back on the tip, the pen draws again and the selection is gone.
+  await penGesture(tutor.page, 'tip', [at(520, 220), at(560, 240), at(600, 220)])
+  await expect(inkPaths(student)).toHaveCount(3, { timeout: 10_000 })
+  await expect(selectedInk).toHaveCount(0)
+
+  // A student's pen has the same controls.
+  const studentBox = await boardBox(student)
+  await penGesture(student, 'eraser', [
+    [studentBox.x + 560, studentBox.y + 180],
+    [studentBox.x + 560, studentBox.y + 280],
+  ])
+  await expect(inkPaths(tutor.page)).toHaveCount(2, { timeout: 10_000 })
+
+  await studentContext.close()
+})
+
 test('the tutor creates a question and Claude grades the boxed region', async ({ users, browser }) => {
   test.skip(process.env.RUN_AI_TESTS !== '1', 'Makes real, billed Claude calls. Set RUN_AI_TESTS=1 to run.')
   test.setTimeout(420_000)

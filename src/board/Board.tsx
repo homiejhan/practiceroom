@@ -7,9 +7,15 @@
  * adds the tools on top: pan, select, type, pen, highlighter, and (tutor only)
  * the region box that Claude grades.
  *
- * Two pieces of local state paper over how CanvasRoom echoes writes:
+ * A stylus's hardware controls work under any tool (see `penInput.ts`): its
+ * eraser end erases ink and its side button selects, each for one gesture.
+ *
+ * Three pieces of local state paper over how CanvasRoom echoes writes:
  * - `pending`: a new shape is drawn immediately and dropped once the server's
  *   copy (same id) arrives, so ink never flickers.
+ * - `erased`: ink the eraser touched is hidden immediately and stays hidden
+ *   until the server's delete arrives. Like a patch, the hide is tied to the
+ *   exact shape object, so an undo that brings the ink back shows it again.
  * - `patches`: the server does not echo a move or a prop update back to its
  *   sender, so the sender keeps its own change on top of the synced shape. A
  *   patch is tied to the exact shape object it was made against; any later
@@ -44,8 +50,10 @@ import {
 } from 'lucide-react'
 import { Markdown } from '@/components/Markdown'
 import { cn } from '@/lib/utils'
+import { sweepTouchesStroke, type Point } from './hit'
 import { MathEditor, type MathCommit } from './MathEditor'
 import { renderLatex } from './math'
+import { penBind } from './penInput'
 import { captureRegion, type RegionCapture } from './renderRegion'
 import {
   HIGHLIGHTER_COLORS,
@@ -110,14 +118,26 @@ type Gesture =
   | { kind: 'marquee'; startX: number; startY: number }
   | { kind: 'region'; startX: number; startY: number }
   | { kind: 'type'; startX: number; startY: number; hitId: string | null }
+  /** The pen's eraser end. `x`/`y` is the last sample, in world space. */
+  | { kind: 'erase'; x: number; y: number }
 
 const MIN_ZOOM = 0.25
 const MAX_ZOOM = 4
 const DOUBLE_CLICK_MS = 350
 const QUESTION_GAP = 280
+/** Screen pixels, so the eraser feels the same size at any zoom. */
+const ERASER_RADIUS = 10
+/** How close (in screen pixels) a pen-button tap must be to ink to select it. */
+const TAP_REACH = 9
 
 const clamp = (value: number, min: number, max: number): number =>
   Math.min(max, Math.max(min, value))
+
+/** Every sample the browser folded into one pointermove, so fast strokes keep their shape. */
+const samplesOf = (event: React.PointerEvent): PointerEvent[] => {
+  const samples = event.nativeEvent.getCoalescedEvents?.() ?? []
+  return samples.length ? samples : [event.nativeEvent]
+}
 
 const isTypingTarget = (target: EventTarget | null): boolean =>
   target instanceof HTMLElement &&
@@ -274,6 +294,7 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
 
   const [pending, setPending] = useState<Shape[]>([])
   const [patches, setPatches] = useState<Map<string, Patch>>(() => new Map())
+  const [erased, setErased] = useState<Map<string, Shape>>(() => new Map())
   const [selection, setSelection] = useState<Set<string>>(() => new Set())
   const [drag, setDrag] = useState<{ ids: Set<string>; dx: number; dy: number } | null>(null)
   const [marquee, setMarquee] = useState<Rect | null>(null)
@@ -290,31 +311,41 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
   const cursorPoint = useRef<{ x: number; y: number } | null>(null)
   const lastTap = useRef<{ id: string | null; at: number }>({ id: null, at: 0 })
   const editorKey = useRef(0)
+  const eraserRing = useRef<HTMLDivElement>(null)
+  const lastPointerType = useRef('')
+  // Read by pointer handlers that can fire several times before a re-render.
+  const erasedRef = useRef(erased)
+  erasedRef.current = erased
 
   // --- Synced shapes + local overlay ---------------------------------------
 
   const hookById = useMemo(() => new Map(shapes.map((shape) => [shape.id, shape])), [shapes])
 
   const all = useMemo(() => {
-    const merged = shapes.map((shape) => {
+    const merged: Shape[] = []
+    for (const shape of shapes) {
+      if (erased.get(shape.id) === shape) continue
       const patch = patches.get(shape.id)
-      if (!patch || patch.base !== shape) return shape
-      return {
+      if (!patch || patch.base !== shape) {
+        merged.push(shape)
+        continue
+      }
+      merged.push({
         ...shape,
         x: patch.x ?? shape.x,
         y: patch.y ?? shape.y,
         props: patch.props ? { ...shape.props, ...patch.props } : shape.props,
-      }
-    })
+      })
+    }
     for (const shape of pending) if (!hookById.has(shape.id)) merged.push(shape)
     return merged
-  }, [shapes, pending, patches, hookById])
+  }, [shapes, pending, patches, erased, hookById])
 
   const allRef = useRef(all)
   allRef.current = all
 
-  // Drop pending copies once the server's version exists, and patches whose
-  // base shape has been replaced by a newer message.
+  // Drop pending copies once the server's version exists, and patches and
+  // eraser hides whose base shape has been removed or replaced by a newer message.
   useEffect(() => {
     setPending((prev) => {
       const next = prev.filter((shape) => !hookById.has(shape.id))
@@ -325,6 +356,17 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
       const next = new Map(prev)
       for (const [id, patch] of prev) {
         if (hookById.get(id) !== patch.base) {
+          next.delete(id)
+          changed = true
+        }
+      }
+      return changed ? next : prev
+    })
+    setErased((prev) => {
+      let changed = false
+      const next = new Map(prev)
+      for (const [id, base] of prev) {
+        if (hookById.get(id) !== base) {
           next.delete(id)
           changed = true
         }
@@ -579,18 +621,104 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
     [addLocal, highlightColor, penColor, penSize],
   )
 
+  const capture = (pointerId: number) => {
+    try {
+      containerRef.current?.setPointerCapture(pointerId)
+    } catch {
+      // The pointer was already released; the gesture just ends at the edge.
+    }
+  }
+
+  /** Show the eraser's outline at a screen position, or hide it with `null`. */
+  const moveEraserRing = (at: { clientX: number; clientY: number } | null) => {
+    const ring = eraserRing.current
+    if (!ring) return
+    if (!at) {
+      delete ring.dataset.on
+      return
+    }
+    const box = containerRef.current?.getBoundingClientRect()
+    ring.style.transform = `translate(${at.clientX - (box?.left ?? 0)}px, ${at.clientY - (box?.top ?? 0)}px)`
+    ring.dataset.on = ''
+  }
+
+  /** Erase every stroke the eraser passed over between two world points. */
+  const eraseAlong = (from: Point, to: Point) => {
+    const radius = ERASER_RADIUS / viewRef.current.zoom
+    let next: Map<string, Shape> | null = null
+    for (const shape of allRef.current) {
+      if (shape.type !== 'stroke') continue
+      // Only ink the server already has: its delete message is what ends the hide.
+      const base = hookById.get(shape.id)
+      if (!base || erasedRef.current.get(shape.id) === base) continue
+      if (!sweepTouchesStroke(shape, from, to, radius)) continue
+      next ??= new Map(erasedRef.current)
+      next.set(shape.id, base)
+      deleteShape(shape.id)
+    }
+    if (next) {
+      erasedRef.current = next
+      setErased(next)
+    }
+  }
+
+  /**
+   * The topmost shape under a world point, found by geometry. The Select
+   * tool's clickable layers are only rendered while that tool is active, so a
+   * pen-button selection under another tool cannot use them.
+   */
+  const hitAt = (point: Point): string | null => {
+    const shapesHere = allRef.current
+    const reach = TAP_REACH / viewRef.current.zoom
+    for (let i = shapesHere.length - 1; i >= 0; i--) {
+      const shape = shapesHere[i]
+      if (shape.type === 'stroke' && sweepTouchesStroke(shape, point, point, reach)) return shape.id
+    }
+    for (let i = shapesHere.length - 1; i >= 0; i--) {
+      const shape = shapesHere[i]
+      if (shape.type === 'stroke') continue
+      const box = measure(shape)
+      if (
+        point.x >= box.x &&
+        point.x <= box.x + box.w &&
+        point.y >= box.y &&
+        point.y <= box.y + box.h
+      ) {
+        return shape.id
+      }
+    }
+    return null
+  }
+
   const onPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (event.button === 2) return
+    lastPointerType.current = event.pointerType
+    const bind = penBind(event)
+    if (event.button === 2 && !bind) return
     const target = event.target as Element
     if (target.closest('[data-board-ui]')) return
-    const container = containerRef.current
-    if (!container) return
+    if (!containerRef.current) return
     const world = toWorld(event.clientX, event.clientY)
-    const hitId = target.closest('[data-shape-id]')?.getAttribute('data-shape-id') ?? null
 
-    const panning = event.button === 1 || tool === 'pan' || spaceHeld
+    // The pen's eraser end erases ink, whichever tool is selected.
+    if (bind === 'erase') {
+      if (!canWrite) return
+      capture(event.pointerId)
+      gesture.current = { kind: 'erase', x: world.x, y: world.y }
+      moveEraserRing(event)
+      eraseAlong(world, world)
+      return
+    }
+
+    // The pen's side button selects for this one gesture.
+    const active: Tool = bind === 'select' ? 'select' : tool
+    const hitId =
+      bind === 'select'
+        ? hitAt(world)
+        : (target.closest('[data-shape-id]')?.getAttribute('data-shape-id') ?? null)
+
+    const panning = !bind && (event.button === 1 || tool === 'pan' || spaceHeld)
     if (panning) {
-      container.setPointerCapture(event.pointerId)
+      capture(event.pointerId)
       gesture.current = {
         kind: 'pan',
         startX: event.clientX,
@@ -600,25 +728,27 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
       return
     }
 
-    if (tool === 'region') {
+    if (active === 'region') {
       if (!isTutor || checking) return
-      container.setPointerCapture(event.pointerId)
+      capture(event.pointerId)
       gesture.current = { kind: 'region', startX: world.x, startY: world.y }
       setRegion({ x: world.x, y: world.y, w: 0, h: 0 })
       return
     }
 
     if (!canWrite) return
-    container.setPointerCapture(event.pointerId)
+    capture(event.pointerId)
 
-    if (tool === 'pen' || tool === 'highlighter') {
+    if (active === 'pen' || active === 'highlighter') {
+      // A selection made with the pen's side button should not linger under new ink.
+      if (selection.size) setSelection(new Set())
       gesture.current = { kind: 'draw' }
       draft.current = [world.x, world.y]
       setDraftTick((tick) => tick + 1)
       return
     }
 
-    if (tool === 'type') {
+    if (active === 'type') {
       gesture.current = { kind: 'type', startX: event.clientX, startY: event.clientY, hitId }
       return
     }
@@ -668,10 +798,21 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
         })
         break
       }
+      case 'erase': {
+        let from: Point = { x: active.x, y: active.y }
+        for (const sample of samplesOf(event)) {
+          const to = toWorld(sample.clientX, sample.clientY)
+          eraseAlong(from, to)
+          from = to
+        }
+        active.x = from.x
+        active.y = from.y
+        moveEraserRing(event)
+        break
+      }
       case 'draw': {
         const minStep = 1.2 / viewRef.current.zoom
-        const samples = event.nativeEvent.getCoalescedEvents?.() ?? [event.nativeEvent]
-        for (const sample of samples.length ? samples : [event.nativeEvent]) {
+        for (const sample of samplesOf(event)) {
           const point = toWorld(sample.clientX, sample.clientY)
           const points = draft.current
           const dx = point.x - points[points.length - 2]
@@ -714,6 +855,9 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
     const world = toWorld(event.clientX, event.clientY)
 
     switch (active.kind) {
+      case 'erase':
+        moveEraserRing(null)
+        break
       case 'draw':
         if (draft.current.length === 2) draft.current.push(world.x + 0.01, world.y)
         finishStroke(tool === 'highlighter')
@@ -893,6 +1037,11 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerUp}
       onPointerLeave={() => publishCursor(null)}
+      // A pen's side button and its press-and-hold both ask for a context
+      // menu; on a drawing surface that would cover the ink. A mouse keeps it.
+      onContextMenu={(event) => {
+        if (lastPointerType.current === 'pen') event.preventDefault()
+      }}
       data-testid="board"
     >
       <div
@@ -940,6 +1089,7 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
       </div>
 
       {/* Screen-space overlays */}
+      <div ref={eraserRing} className="board-eraser" aria-hidden="true" />
       {marquee && <div className="board-marquee" style={toScreen(marquee)} />}
 
       {peers.map((peer) => {
