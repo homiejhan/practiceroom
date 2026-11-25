@@ -93,6 +93,81 @@ const MATH_FORMAT_RULES = [
   'Do not use LaTeX environments that need extra packages; plain KaTeX-compatible LaTeX only.',
 ].join(' ')
 
+/**
+ * How Claude writes a table, a graph or a geometry figure. The app draws these
+ * blocks (`src/visuals/`), so this text has to match what the parser reads:
+ * anything it promises here must be something `checkVisuals` accepts.
+ */
+export const VISUAL_FORMAT_RULES = [
+  'VISUALS. Text can include tables, graphs and geometry figures, which the app draws. Use one when the problem is about it, or when a picture makes a step clearer. Do not decorate.',
+  '',
+  'TABLE: Markdown pipe rows, each starting and ending with |, with a row of dashes after the first row. Leave a cell empty for the student to fill in.',
+  '| $x$ | $-1$ | $0$ | $1$ |',
+  '|:---:|:---:|:---:|:---:|',
+  '| $y$ |  |  |  |',
+  '',
+  'GRAPH (coordinate plane): a block that starts with a line [graph] and ends with a line [/graph], with one setting or item per line.',
+  '[graph]',
+  'x: -5 to 5',
+  'y: -5 to 5',
+  'y = 2x - 3 [label: $f$]',
+  'y = x + 3 for -3 <= x < 0',
+  'y >= -x + 2',
+  'point A (1, -1)',
+  '[/graph]',
+  'Settings: "x: a to b" and "y: a to b" set the window (default -10 to 10; "-2pi to 2pi" works); "step: 1" (or xstep, ystep) sets the grid spacing; "xlabel: Hours", "ylabel: Cost"; "size: small" (or medium, large); "title: A)"; "grid: off".',
+  'Items: "y = ..." or "f(x) = ..." plots a function of x. "y > ...", "y <= ..." shade an inequality (the boundary is dashed when strict). "x = 2" is a vertical line. Ending a function with "for -3 <= x < 1" restricts its domain and draws closed or open endpoint dots. Also: "point A (1, 3)", "open point (2, 1)", "points (0, 1) (1, 3) (2, 5)", "segment P(0, 0) to Q(3, 4)", "line (0, 1) (2, 5)", "vector (0, 0) to (3, 2)", "polygon A(1, 1) B(4, 1) C(4, 3)", "circle (0, 0) radius 3", "text (4, 5) Region $R$".',
+  'Expressions use x only: 2x, x^2, (x+1)(x-2), 1/(x-1), |x - 2|, sqrt(x), cbrt(x), sin(x), cos(x), tan(x), ln(x), log(x), exp(x), pi, e. A block with only a window is a blank grid for the student to draw on.',
+  '',
+  'FIGURE (geometry, drawn to scale, no axes): a block that starts with a line [figure] and ends with a line [/figure]. Points are capital letters, and a point must be created before a later line uses it.',
+  '[figure]',
+  'triangle ABC AB=8 angle A=50 angle B=60',
+  'side AB 8 cm',
+  'side BC $x$',
+  'angle A 50°',
+  '[/figure]',
+  'Shapes: "triangle ABC AB=5 BC=6 CA=7" (or two sides and the angle between them, or two angles and a side); "triangle A(0,0) B(6,0) C(2,4)"; "right triangle ABC legs 3 4" (right angle at B); "rectangle ABCD width 6 height 4"; "square ABCD side 4"; "parallelogram ABCD base 7 side 4 angle 65"; "rhombus ABCD side 5 angle 60"; "trapezoid ABCD bottom 10 top 6 height 4"; "regular ABCDEF side 3"; "polygon A(0,0) B(4,0) C(5,3) D(1,3)"; "circle O radius 3"; "sector O radius 4 from 30 to 100".',
+  'Points and lines: "point P (2, 3)"; "point M midpoint A B"; "point D foot C A B" (foot of the perpendicular from C to line AB); "point P on A B 0.25"; "point P from O 3 at 40" (3 units from O in the 40 degree direction); "segment A B"; "line A B"; "ray A B".',
+  'Marks: "side AB 8 cm" labels a side with any text or $math$; "side AB [ticks: 1]" adds congruence ticks; "side AB [parallel: 1]" adds parallel arrows; "angle A 50°" labels the angle at a corner of a shape; "angle ABC $x^\\circ$" names three points with the vertex in the middle; "right angle ABC" draws the square corner. "side AB measure" and "angle A measure" print the true value: use these only in a solution.',
+  '',
+  'Options go in one bracket at the end of a line: [red, dashed, label: $f$]. Colors: navy, blue, red, green, orange, purple, gold, gray, black. Also: dotted, thick, thin, fill, noshade.',
+  'Rules for visuals: build each one from the real numbers of the problem, so it is true to scale. In a question, never let the picture give away the answer: label the unknown $x$ or leave it unlabeled. Use only the settings, items and options listed here, because anything else is not drawn. Put [graph], [/graph], [figure] and [/figure] on lines of their own.',
+].join('\n')
+
+/**
+ * The same format in a quarter of the words, for calls where a visual is an
+ * occasional extra (grading, the tutor's assistant). Every token of a system
+ * prompt is paid for on every call, and those calls are frequent.
+ */
+export const VISUAL_FORMAT_BRIEF = [
+  'VISUALS. The app draws tables, graphs and geometry figures written as below. Use only these kinds of lines, because anything else is not drawn.',
+  'Table: pipe rows with a row of dashes after the first.',
+  '| $x$ | $1$ | $2$ |',
+  '|:---:|:---:|:---:|',
+  '| $y$ |  |  |',
+  'Graph: functions of x, inequalities, vertical lines, points and segments on a coordinate plane.',
+  '[graph]',
+  'x: -5 to 5',
+  'y: -5 to 5',
+  'y = 2x - 3 [red, dashed, label: $f$]',
+  'y = x + 3 for -3 <= x < 0',
+  'y >= -x + 2',
+  'point A (1, -1)',
+  'segment P(0, 0) to Q(3, 4)',
+  '[/graph]',
+  'Figure: geometry drawn to scale from its real measurements. Points are capital letters.',
+  '[figure]',
+  'triangle ABC AB=8 angle A=50 angle B=60',
+  'point M midpoint A B',
+  'segment C M [dashed]',
+  'side AB 8 cm',
+  'angle A 50°',
+  '[/figure]',
+  'Other shapes: "right triangle ABC legs 3 4", "rectangle ABCD width 6 height 4", "square ABCD side 4", "parallelogram ABCD base 7 side 4 angle 65", "trapezoid ABCD bottom 10 top 6 height 4", "circle O radius 3".',
+  'Other marks: "side AB $x$", "angle ABC $x^\\circ$", "right angle ABC".',
+  'The tags [graph], [/graph], [figure] and [/figure] go on lines of their own.',
+].join('\n')
+
 export function questionTypesPrompt(location: TopicLocation): { system: string; content: string } {
   return {
     system: [
@@ -103,7 +178,10 @@ export function questionTypesPrompt(location: TopicLocation): { system: string; 
       'Give 4 to 6 types. Each differs in the skill or format it exercises, not just in the numbers.',
       '"name" is at most 5 words. "description" is one sentence saying what the student has to do.',
       '"example" is one complete, representative problem of that type, free response, with clean numbers and no answer or hint.',
+      'When a type is about reading or completing a graph, a geometric figure or a table, its example includes that visual in the format below.',
       MATH_FORMAT_RULES,
+      '',
+      VISUAL_FORMAT_RULES,
     ].join('\n'),
     content: [
       `Course: ${location.subject.name}`,
@@ -152,15 +230,43 @@ const QUESTION_SYSTEM = [
   'Return ONLY a JSON object, no prose and no code fence, shaped as:',
   '{"title":"...","question":"...","answer":"...","solution":"..."}',
   '"title": at most 6 words naming the skill.',
-  '"question": the problem exactly as the student will see it on a whiteboard. Self-contained, free response unless told otherwise, no answer, no hint, no worked steps. Keep it short enough to read at a glance.',
+  '"question": the problem exactly as the student will see it on a whiteboard. Self-contained, free response unless told otherwise, no answer, no hint, no worked steps. Keep it short enough to read at a glance. If the problem is about a graph, a geometric figure or a table of data, show it as a visual (format below) instead of describing it in words.',
   '"answer": only the final answer, in simplest form.',
-  '"solution": a numbered step-by-step worked solution a tutor could read aloud, ending with the final answer.',
+  '"solution": a numbered step-by-step worked solution a tutor could read aloud, ending with the final answer. Where a picture makes a step clearer (the finished graph, the figure with the values found), include one visual.',
   MATH_FORMAT_RULES,
   'Quality rules, in order:',
   '1. Decide the answer first and pick clean numbers so it comes out as an integer, a simple fraction, or a short exact form.',
   '2. Solve the finished problem from scratch, then check the result by a different method (substitute it back, or solve another way). If the two disagree, fix the problem before you answer.',
   '3. The answer and the last line of the solution must match exactly.',
+  '4. If you draw a visual, check it against the problem: the same numbers, the same labels, and nothing that reveals the answer in the question.',
+  '',
+  VISUAL_FORMAT_RULES,
 ].join('\n')
+
+/**
+ * A second attempt at a reply whose visuals could not all be drawn. The
+ * parser's own messages go back to Claude, which usually fixes the line.
+ */
+export function visualRepairRequest(
+  request: { system: string; content: string },
+  previousReply: string,
+  problems: string[],
+): { system: string; content: string } {
+  return {
+    system: request.system,
+    content: [
+      request.content,
+      '',
+      'Your previous reply was:',
+      previousReply,
+      '',
+      'These lines of its visuals could not be drawn:',
+      ...problems.slice(0, 12).map((problem) => `- ${problem}`),
+      '',
+      'Return the whole JSON object again with the visuals corrected. Keep the problem and its answer the same. Use only lines from the visual format; if a picture cannot be made that way, leave it out and describe it in words.',
+    ].join('\n'),
+  }
+}
 
 export function questionFromPromptRequest(
   prompt: string,
@@ -265,6 +371,10 @@ const GRADING_SYSTEM = [
   'Number the questions in reading order and refer to them by their card title or first few words, never by the [Q1]/[T1] labels, which the readers cannot see.',
   MATH_FORMAT_RULES,
   'Be warm and direct, speak to the student, and do not add a preamble or a closing summary.',
+  '',
+  'A question\'s text may contain a table, a [graph] block or a [figure] block. The student sees those as drawings on the card; read them as written (the format is below). In a Solution you may add one visual in the same format when it makes the explanation clearer, for example the graph with the answer marked or the figure with the missing length filled in.',
+  '',
+  VISUAL_FORMAT_BRIEF,
 ].join('\n')
 
 export function gradingRequest(input: {

@@ -255,7 +255,24 @@
 .md hr { border: 0; border-top: 1px solid var(--color-border); margin: 1em 0; }
 .md .katex-display { margin: 0.6em 0; overflow-x: auto; overflow-y: hidden; padding: 2px 0; }
 .md table { border-collapse: collapse; margin: 0.6em 0; }
-.md th, .md td { border: 1px solid var(--color-border); padding: 0.25em 0.6em; }
+.md th, .md td { border: 1px solid var(--color-border); padding: 0.25em 0.6em; text-align: center; }
+.md th { background: rgba(25, 70, 140, 0.08); font-weight: 650; }
+/* An empty cell is somewhere for the student to write. */
+.md td:empty { min-width: 3.2em; height: 2em; }
+
+/* Graphs and geometry figures drawn from [graph] / [figure] blocks. They sit
+   on white like paper, whatever they are placed on. */
+.visual-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; margin: 0.6em 0; max-width: 100%; overflow-x: auto; }
+.visual { flex: none; margin: 0; padding: 4px; background: #ffffff; border: 1px solid #e3e1d9; border-radius: 8px; color: #16161a; }
+.visual-canvas { position: relative; }
+.visual-canvas svg { display: block; }
+.visual-label { position: absolute; white-space: nowrap; font-size: 13px; line-height: 1.25; pointer-events: none; }
+.visual-label.is-small { font-size: 11px; }
+.visual-label.is-bold { font-weight: 700; }
+.visual-label.is-backed { background: rgba(255, 255, 255, 0.82); border-radius: 3px; padding: 0 1.5px; }
+.visual-label .katex { font-size: 1.04em; }
+.visual figcaption { font-size: 11px; color: #7a7f87; text-align: center; padding: 2px 4px; }
+.visual-failed { padding: 8px 10px; }
 
 /* Whiteboard surface */
 .board {

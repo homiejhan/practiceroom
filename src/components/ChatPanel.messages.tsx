@@ -14,10 +14,12 @@ import remarkMath from 'remark-math'
 import 'katex/dist/katex.min.css'
 import { Check, Copy } from 'lucide-react'
 import 'highlight.js/styles/atom-one-dark.css'
+import { normalizeTables } from '@/visuals'
 import type {
   MessagePart,
   ToolInvocation,
 } from './ChatPanel.stream'
+import { WithVisuals } from './Markdown'
 
 type MessageTurnProps = {
   role: 'user' | 'assistant' | 'system'
@@ -171,13 +173,20 @@ function MarkdownText({ children }: { children: string }) {
                  [&_th]:border [&_th]:border-border [&_th]:px-2 [&_th]:py-1 [&_th]:font-semibold [&_th]:text-left
                  [&_td]:border [&_td]:border-border [&_td]:px-2 [&_td]:py-1"
     >
-      <ReactMarkdown
-        remarkPlugins={REMARK_PLUGINS}
-        rehypePlugins={REHYPE_PLUGINS}
-        components={MARKDOWN_COMPONENTS}
+      {/* Graphs, figures and tables are drawn here as they are on the board. */}
+      <WithVisuals
+        renderText={(text) => (
+          <ReactMarkdown
+            remarkPlugins={REMARK_PLUGINS}
+            rehypePlugins={REHYPE_PLUGINS}
+            components={MARKDOWN_COMPONENTS}
+          >
+            {normalizeTables(text)}
+          </ReactMarkdown>
+        )}
       >
         {children}
-      </ReactMarkdown>
+      </WithVisuals>
     </div>
   )
 }

@@ -20,7 +20,9 @@ import {
   questionTypesPrompt,
   readGeneratedQuestion,
   readQuestionTypes,
+  visualRepairRequest,
   type Difficulty,
+  type GeneratedQuestion,
   type QuestionType,
   type RegionQuestion,
   type RegionTyped,
@@ -30,7 +32,12 @@ import { spendAiCall, spendRecapEmail } from '../server/ai-usage.js'
 import { ROOM_ID_RE } from '../server/guest.js'
 import { recordTools } from '../server/record-tools.js'
 import { buildRecapEmail, buildWorksheetLatex } from '../server/worksheet.js'
+import { checkVisuals } from '../visuals/index.js'
 import type { Env } from '../../worker.js'
+
+/** Lines of the question's graphs and figures that the app cannot draw. */
+const visualProblems = (question: GeneratedQuestion): string[] =>
+  checkVisuals([question.question, question.answer, question.solution].join('\n'))
 
 const fail = (error: string): ActionResult<never> => ({ success: false, error })
 
@@ -266,8 +273,18 @@ export const actions: Record<string, ActionHandler<Env>> = {
 
     const reply = await callClaude(tools, request)
     if (!reply.ok) return fail(reply.error)
-    const question = readGeneratedQuestion(reply.text)
+    let question = readGeneratedQuestion(reply.text)
     if (!question) return fail('Claude did not return a usable question. Try again.')
+
+    // A graph or figure with a line the app cannot draw goes back to Claude
+    // once, with the parser's own messages. The second reply is kept only if
+    // it is better; either way the rest of each picture still draws.
+    const problems = visualProblems(question)
+    if (problems.length) {
+      const retry = await callClaude(tools, visualRepairRequest(request, reply.text, problems))
+      const repaired = retry.ok ? readGeneratedQuestion(retry.text) : null
+      if (repaired && visualProblems(repaired).length < problems.length) question = repaired
+    }
 
     const stored = await tools.create('question_keys', {
       roomId: room.roomId,

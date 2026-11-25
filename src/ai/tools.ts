@@ -12,6 +12,7 @@ import type { ToolSet } from 'ai'
 import { z } from 'zod/v4'
 import { BUILT_IN_TOOLS, applyAiToolDefaults } from 'deepspace/worker'
 import type { ToolSchema, CollectionSchema } from 'deepspace/worker'
+import { VISUAL_FORMAT_BRIEF } from '../server/ai.js'
 
 type ToolExecutor = (toolName: string, params: Record<string, unknown>) => Promise<unknown>
 
@@ -61,6 +62,8 @@ export function buildSystemPrompt(appName: string, schemas: CollectionSchema[]):
     'specific mistake, draft warm-up or follow-up problems, and check the tutor\'s own reasoning.',
     'When you write a problem, give the answer and a short worked solution with it.',
     'Write all math in LaTeX: inline as $...$ and display as $$...$$. Keep answers concise.',
+    '',
+    VISUAL_FORMAT_BRIEF,
     '',
     'You have read-only tools over the tutor\'s own data. The useful collections are `rooms` (their',
     'rooms) and `question_keys` (the questions they generated, each with roomId, question, answer and',

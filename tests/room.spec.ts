@@ -311,6 +311,136 @@ test("a pen's eraser end erases and its side button selects, under any tool", as
   await studentContext.close()
 })
 
+test('graphs, figures and tables written in text are drawn for everyone', async ({ users, browser }) => {
+  test.setTimeout(90_000)
+  const [tutor] = await users(1)
+  const roomPath = await createRoom(tutor.page, 'Visuals')
+  const roomId = roomPath.split('/').pop()
+  const studentContext = await browser.newContext()
+  const student = await studentContext.newPage()
+  await joinAsStudent(student, roomPath, 'Maya')
+
+  // Chat text goes through the same renderer as question cards, answer keys
+  // and grading results, so a message exercises it end to end at no cost.
+  const body = [
+    'Fill in the table, then graph it.',
+    '| $x$ | $-1$ | $0$ | $1$ |',
+    '| $y$ |  |  |  |',
+    '[graph]',
+    'x: -5 to 5',
+    'y: -5 to 5',
+    'y = 2x - 1 [label: $f$]',
+    'y = x + 3 for -3 <= x < 0',
+    'point A (1, 1)',
+    '[/graph]',
+    '[figure]',
+    'triangle ABC AB=8 angle A=50 angle B=60',
+    'side AB 8 cm',
+    'angle C $x^\\circ$',
+    '[/figure]',
+  ].join('\n')
+  const posted = await student.request.post(`/api/rooms/${roomId}/messages`, { data: { body } })
+  expect(posted.ok()).toBe(true)
+
+  for (const page of [tutor.page, student]) {
+    await page.getByTestId('chat-toggle').click()
+    const graph = page.locator('[data-visual="graph"]')
+    const figure = page.locator('[data-visual="figure"]')
+    await expect(graph).toHaveCount(1, { timeout: 15_000 })
+    await expect(figure).toHaveCount(1)
+
+    // The graph: two curves in the first two colours, the point, and both
+    // endpoint dots of the restricted piece (one of them open).
+    await expect(graph.locator('svg path[stroke="#19468c"]')).toHaveCount(1)
+    await expect(graph.locator('svg path[stroke="#c8322b"]')).toHaveCount(1)
+    await expect(graph.locator('svg circle')).toHaveCount(3)
+    await expect(graph.locator('svg circle[fill="#ffffff"]')).toHaveCount(1)
+    await expect(graph.locator('.visual-label .katex').filter({ hasText: 'f' }).first()).toBeVisible()
+
+    // The figure: a closed outline and its labels, with math typeset.
+    await expect(figure.locator('svg path[d$="Z"]')).toHaveCount(1)
+    await expect(figure.getByText('8 cm')).toBeVisible()
+    await expect(figure.locator('.visual-label .katex').filter({ hasText: 'x' }).first()).toBeVisible()
+
+    // The table: the missing rule row is supplied, and empty cells are kept to write in.
+    const table = page.locator('.md table')
+    await expect(table).toHaveCount(1)
+    await expect(table.locator('th')).toHaveCount(4)
+    await expect(table.locator('td')).toHaveCount(4)
+
+    // Everything fits the chat column, and nothing fell back to an error note.
+    const chatColumn = 360
+    for (const visual of [graph, figure]) {
+      const box = await visual.boundingBox()
+      expect(box!.width).toBeLessThan(chatColumn - 40)
+    }
+    await expect(page.getByText(/could not be drawn/)).toHaveCount(0)
+  }
+  await shot(tutor.page, 'visuals-chat')
+
+  // A block the app cannot draw says so instead of showing something wrong.
+  await student.request.post(`/api/rooms/${roomId}/messages`, {
+    data: { body: '[figure]\ntriangle ABC AB=1 BC=1 CA=5\n[/figure]' },
+  })
+  await expect(tutor.page.getByText('This figure could not be drawn.')).toBeVisible({ timeout: 15_000 })
+
+  await studentContext.close()
+})
+
+test('Claude draws a figure, a table and a graph when a problem calls for them', async ({ users, browser }) => {
+  test.skip(process.env.RUN_AI_TESTS !== '1', 'Makes real, billed Claude calls. Set RUN_AI_TESTS=1 to run.')
+  test.setTimeout(420_000)
+
+  const [tutor] = await users(1)
+  const roomPath = await createRoom(tutor.page, 'Visual questions')
+  const studentContext = await browser.newContext()
+  const student = await studentContext.newPage()
+  await joinAsStudent(student, roomPath, 'Maya')
+  const describe = tutor.page.getByLabel('Describe the problem')
+  const create = tutor.page.getByRole('button', { name: 'Create question' })
+
+  // A geometry problem: the card shows a to-scale figure on both boards.
+  await describe.fill(
+    'Triangle ABC has angle A = 50 degrees, angle B = 60 degrees and side AB = 8 cm. Show the triangle and ask for angle C.',
+  )
+  await create.click()
+  await expect(student.locator('.board-question')).toHaveCount(1, { timeout: 120_000 })
+  const first = student.locator('.board-question').nth(0)
+  await expect(first.locator('[data-visual="figure"] svg')).toBeVisible({ timeout: 15_000 })
+  await shot(tutor.page, 'visuals-figure-question')
+
+  // A table of values to complete and a blank grid to graph on.
+  await describe.fill(
+    'Give a table of values for y = 2x - 1 at x = -1, 0, 1, 2 with the y row left blank for the student, and a blank coordinate grid from -5 to 5 to graph the line on.',
+  )
+  await create.click()
+  await expect(student.locator('.board-question')).toHaveCount(2, { timeout: 120_000 })
+  const second = student.locator('.board-question').nth(1)
+  await expect(second.locator('table')).toHaveCount(1, { timeout: 15_000 })
+  await expect(second.locator('[data-visual="graph"] svg')).toBeVisible()
+  // The tutor's board scrolls to a new card; the student's stays where it was.
+  await shot(tutor.page, 'visuals-table-graph-question')
+
+  // Claude wrote only lines the app can draw.
+  await expect(student.getByText(/could not be drawn/)).toHaveCount(0)
+
+  // The same text typesets for print: the worksheet compiles with its figures.
+  await tutor.page.getByRole('tab', { name: 'Session' }).click()
+  await expect(tutor.page.getByText('Worked solution', { exact: true }).first()).toBeVisible({ timeout: 15_000 })
+  await shot(tutor.page, 'visuals-answer-keys')
+  await tutor.page.getByRole('button', { name: 'Make worksheet PDF' }).click()
+  const worksheetLink = tutor.page.getByRole('link', { name: 'Open worksheet' })
+  await expect(worksheetLink).toBeVisible({ timeout: 90_000 })
+  const worksheet = await student.request.get((await worksheetLink.getAttribute('href'))!)
+  expect((await worksheet.body()).subarray(0, 5).toString()).toBe('%PDF-')
+  if (SHOT_DIR) {
+    const fs = await import('node:fs')
+    fs.writeFileSync(path.join(SHOT_DIR, 'visuals-worksheet.pdf'), await worksheet.body())
+  }
+
+  await studentContext.close()
+})
+
 test('the tutor creates a question and Claude grades the boxed region', async ({ users, browser }) => {
   test.skip(process.env.RUN_AI_TESTS !== '1', 'Makes real, billed Claude calls. Set RUN_AI_TESTS=1 to run.')
   test.setTimeout(420_000)

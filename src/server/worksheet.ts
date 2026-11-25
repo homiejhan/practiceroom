@@ -4,9 +4,14 @@
  * Questions and solutions are stored as Markdown with `$...$` math (that is
  * what the board and chat render). A printed worksheet needs real LaTeX, so
  * this converts the small Markdown subset Claude is told to write — paragraphs,
- * numbered and bulleted lists, bold, italics, inline and display math — and
- * escapes everything else, so stray characters cannot break the compile.
+ * numbered and bulleted lists, bold, italics, inline and display math, pipe
+ * tables — and escapes everything else, so stray characters cannot break the
+ * compile. `[graph]` and `[figure]` blocks are drawn with TikZ from the same
+ * scene the browser draws as SVG.
  */
+
+import { buildVisual, isRuleRow, isTableRow, splitVisuals, tableCells } from '../visuals/index.js'
+import { sceneToTikz } from '../visuals/tikz.js'
 
 export interface WorksheetQuestion {
   title: string
@@ -104,7 +109,7 @@ function escapeText(text: string): string {
 }
 
 /** One line of Markdown (no block structure) to LaTeX. */
-function inlineToLatex(line: string): string {
+export function inlineToLatex(line: string): string {
   const math: string[] = []
   const stash = (latex: string): string => {
     math.push(latex)
@@ -133,8 +138,39 @@ function inlineToLatex(line: string): string {
 
 type ListKind = 'enumerate' | 'itemize'
 
-/** Markdown (the subset described above) to a LaTeX fragment. */
-export function markdownToLatex(markdown: string): string {
+/**
+ * Consecutive pipe rows as a ruled table. A second row of dashes makes the
+ * first row a bold header and sets each column's alignment; an empty cell is
+ * left wide enough to write in.
+ */
+function tableToLatex(rows: string[]): string {
+  const parsed = rows.map(tableCells)
+  const hasHeader = parsed.length >= 2 && isRuleRow(parsed[1])
+  const align = hasHeader
+    ? parsed[1].map((cell) => (cell.startsWith(':') === cell.endsWith(':') ? 'c' : cell.endsWith(':') ? 'r' : 'l'))
+    : []
+  const body = hasHeader ? [parsed[0], ...parsed.slice(2)] : parsed
+  const columns = Math.max(...body.map((row) => row.length))
+  const spec = Array.from({ length: columns }, (_, i) => align[i] ?? 'c').join('|')
+  const line = (cells: string[], bold: boolean): string =>
+    `${Array.from({ length: columns }, (_, i) => {
+      const cell = cells[i] ?? ''
+      if (!cell) return '\\hspace{0.45in}'
+      return bold ? `\\textbf{${inlineToLatex(cell)}}` : inlineToLatex(cell)
+    }).join(' & ')} \\\\ \\hline`
+  return [
+    '\\begin{center}',
+    '{\\renewcommand{\\arraystretch}{1.4}',
+    `\\begin{tabular}{|${spec}|}`,
+    '\\hline',
+    ...body.map((row, i) => line(row, hasHeader && i === 0)),
+    '\\end{tabular}}',
+    '\\end{center}',
+  ].join('\n')
+}
+
+/** Markdown text with no visual blocks in it, to a LaTeX fragment. */
+function textToLatex(markdown: string): string {
   const out: string[] = []
   let list: ListKind | null = null
   const closeList = () => {
@@ -144,11 +180,13 @@ export function markdownToLatex(markdown: string): string {
 
   // Display math written across several lines is joined first so the
   // line-based pass below sees it as one unit.
-  const source = markdown
+  const lines = markdown
     .replace(/\r\n?/g, '\n')
     .replace(/\$\$([\s\S]+?)\$\$/g, (_, body: string) => `$$${body.replace(/\s*\n\s*/g, ' ')}$$`)
+    .split('\n')
 
-  for (const rawLine of source.split('\n')) {
+  for (let index = 0; index < lines.length; index++) {
+    const rawLine = lines[index]
     const line = rawLine.trimEnd()
     if (!line.trim()) {
       // A blank line ends a paragraph but not a list: Markdown lists often
@@ -158,7 +196,16 @@ export function markdownToLatex(markdown: string): string {
     }
     if (/^\s*(```|~~~)/.test(line)) continue
 
-    const numbered = line.match(/^\s*\d+[.)]\s+(.*)$/)
+    if (isTableRow(line)) {
+      let end = index
+      while (isTableRow(lines[end + 1])) end++
+      closeList()
+      out.push(tableToLatex(lines.slice(index, end + 1)))
+      index = end
+      continue
+    }
+
+    const numbered = line.match(/^\s*(\d+)[.)]\s+(.*)$/)
     const bulleted = line.match(/^\s*[-*+]\s+(.*)$/)
     if (numbered || bulleted) {
       const kind: ListKind = numbered ? 'enumerate' : 'itemize'
@@ -167,7 +214,9 @@ export function markdownToLatex(markdown: string): string {
         out.push(`\\begin{${kind}}`)
         list = kind
       }
-      out.push(`\\item ${inlineToLatex((numbered ?? bulleted)![1])}`)
+      // The step's own number is kept, so a list that carries on after a
+      // figure or a table does not start again from 1.
+      out.push(numbered ? `\\item[${numbered[1]}.] ${inlineToLatex(numbered[2])}` : `\\item ${inlineToLatex(bulleted![1])}`)
       continue
     }
 
@@ -187,11 +236,34 @@ export function markdownToLatex(markdown: string): string {
   return out.join('\n').replace(/\n{3,}/g, '\n\n').trim()
 }
 
+/** Markdown (the subset described above) to a LaTeX fragment. */
+export function markdownToLatex(markdown: string): string {
+  const parts: string[] = []
+  // Blocks separated only by blank lines share a row, as they do on screen.
+  let row: string[] = []
+  const flushRow = () => {
+    if (row.length) parts.push(`\\begin{center}\n${row.join('\n\\hspace{0.15in}\n')}\n\\end{center}`)
+    row = []
+  }
+  for (const segment of splitVisuals(markdown)) {
+    if (segment.kind === 'text') {
+      flushRow()
+      parts.push(textToLatex(segment.text))
+    } else {
+      const picture = sceneToTikz(buildVisual(segment.kind, segment.lines), inlineToLatex)
+      if (picture) row.push(picture)
+    }
+  }
+  flushRow()
+  return parts.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+}
+
 export function buildWorksheetLatex(input: WorksheetInput): string {
   const parts: string[] = [
     '\\documentclass[11pt]{article}',
     '\\usepackage{amsmath,amssymb}',
     '\\usepackage[margin=1in]{geometry}',
+    '\\usepackage{tikz}',
     '\\setlength{\\parindent}{0pt}',
     '\\setlength{\\parskip}{6pt}',
     '\\pagestyle{empty}',
@@ -204,8 +276,12 @@ export function buildWorksheetLatex(input: WorksheetInput): string {
 
   input.questions.forEach((question, index) => {
     parts.push(
+      // One unbreakable box per question, so a figure never lands on the page
+      // after the text that refers to it.
+      '\\noindent\\begin{minipage}{\\linewidth}\\setlength{\\parskip}{6pt}',
       `\\textbf{Question ${index + 1}.}\\par`,
       markdownToLatex(question.question),
+      '\\end{minipage}\\par',
       // Room to work the problem by hand.
       '\\vspace{1.7in}',
     )

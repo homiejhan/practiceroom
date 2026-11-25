@@ -20,8 +20,50 @@ describe('markdownToLatex', () => {
   it('turns numbered steps into an enumerate, keeping blank lines between items', () => {
     const latex = markdownToLatex('1. Subtract $7$.\n\n2. Divide by **4**.\n\nDone.')
     expect(latex).toBe(
-      ['\\begin{enumerate}', '\\item Subtract $7$.', '', '\\item Divide by \\textbf{4}.', '', '\\end{enumerate}', 'Done.\\par'].join('\n'),
+      ['\\begin{enumerate}', '\\item[1.] Subtract $7$.', '', '\\item[2.] Divide by \\textbf{4}.', '', '\\end{enumerate}', 'Done.\\par'].join('\n'),
     )
+  })
+
+  it('sets a pipe table as a ruled tabular, with a bold header when there is a rule row', () => {
+    const latex = markdownToLatex(
+      ['| Months ($m$) | Cost |', '|:---|---:|', '| 1 | \\$40 |', '| 3 |  |'].join('\n'),
+    )
+    expect(latex).toContain('\\begin{tabular}{|l|r|}')
+    expect(latex).toContain('\\textbf{Months ($m$)} & \\textbf{Cost} \\\\ \\hline')
+    expect(latex).toContain('1 & \\$40 \\\\ \\hline')
+    // An empty cell is left as room to write.
+    expect(latex).toContain('3 & \\hspace{0.45in} \\\\ \\hline')
+  })
+
+  it('keeps a pipe inside math out of the table columns', () => {
+    const latex = markdownToLatex(['| $x$ | $|x|$ |', '| $-2$ | $2$ |'].join('\n'))
+    expect(latex).toContain('\\begin{tabular}{|c|c|}')
+    expect(latex).toContain('$x$ & $|x|$ \\\\ \\hline')
+  })
+
+  it('draws a graph block with TikZ and keeps the text around it', () => {
+    const latex = markdownToLatex(
+      ['Graph the line.', '[graph]', 'x: -5 to 5', 'y: -5 to 5', 'y = 2x - 1', 'point A (1, 1)', '[/graph]', 'Then find $f(3)$.'].join('\n'),
+    )
+    expect(latex.startsWith('Graph the line.\\par')).toBe(true)
+    expect(latex).toContain('\\begin{tikzpicture}')
+    expect(latex).toContain('{$A$}')
+    expect(latex).not.toContain('[graph]')
+    expect(latex.endsWith('Then find $f(3)$.\\par')).toBe(true)
+  })
+
+  it('escapes figure labels the same way as the text', () => {
+    const latex = markdownToLatex(
+      ['[figure]', 'triangle ABC AB=8 angle A=50 angle B=60', 'side AB 8 cm & more', 'angle A 50°', '[/figure]'].join('\n'),
+    )
+    expect(latex).toContain('{8 cm \\& more}')
+    expect(latex).toContain('{50$^{\\circ}$}')
+  })
+
+  it('keeps step numbers when a figure interrupts a numbered list', () => {
+    const latex = markdownToLatex(['1. Draw it.', '[graph]', 'y = x', '[/graph]', '2. Read the slope.'].join('\n'))
+    expect(latex).toContain('\\item[1.] Draw it.')
+    expect(latex).toContain('\\item[2.] Read the slope.')
   })
 
   it('formats bold text that wraps math', () => {
@@ -55,7 +97,8 @@ describe('buildWorksheetLatex', () => {
     const latex = buildWorksheetLatex({ ...input, includeAnswers: true })
     expect(latex).toContain('\\newpage')
     expect(latex).toContain('\\textbf{Answer:} $x = 6$')
-    expect(latex).toContain('\\item Add $7$.')
+    expect(latex).toContain('\\item[1.] Add $7$.')
+    expect(latex).toContain('\\usepackage{tikz}')
   })
 })
 

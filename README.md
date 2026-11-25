@@ -22,6 +22,9 @@ explanation to the room chat.
 - **Questions on demand** (tutor only): describe a problem in words, or pick subject → unit →
   topic → question type and Claude writes a new problem of that type with different numbers. The
   answer key stays private to the tutor.
+- **Graphs, geometry figures and tables**: a question, its answer key and Claude's explanations
+  can include a coordinate-plane graph, a to-scale geometry figure or a table to fill in. They are
+  drawn on the board, in the chat and in the worksheet PDF.
 - **Check a region** (tutor only): box part of the board, and Claude grades only that part against
   the answer key.
 - **Room chat** for everyone, with LaTeX rendering. Claude posts there only when the tutor checks a
@@ -42,6 +45,7 @@ explanation to the room chat.
 | Claude calls | `anthropic/chat-completion` through the integration proxy | `src/server/ai.ts` |
 | Worksheet PDF | `latex-compiler/compile` integration, stored with `appFiles` | `src/server/worksheet.ts` |
 | Recap email | `email/send` integration | `src/actions/index.ts` |
+| Graphs, figures and tables | None: a parser and layout of my own, drawn as SVG and as TikZ | `src/visuals/` |
 | Tutor's private assistant | The `ai-chat` feature (`ChatPanel` + `streamDeepSpaceAgent`) | `src/components/room/TutorPanel.tsx` |
 | Signing key for guest passes | The app's secrets store (`GUEST_SECRET`) | `src/server/guest.ts` |
 
@@ -77,6 +81,38 @@ an image because handwriting can only be read from pixels. Typed math is sent as
 and appears in the image only as a labelled placeholder, which is more reliable than asking a
 vision model to re-read rendered math. The worker attaches the private answer keys, calls Claude,
 and posts the result to the room chat.
+
+### Graphs, figures and tables
+
+Claude does not draw. It writes a short block of text, and the app draws it:
+
+```
+[graph]                          [figure]
+x: -5 to 5                       triangle ABC AB=8 angle A=50 angle B=60
+y = 2x - 3 [label: $f$]          side AB 8 cm
+y = x + 3 for -3 <= x < 0        angle C $x^\circ$
+point A (1, -1)                  [/figure]
+[/graph]
+```
+
+The block format is the one my TutorAssist project's worksheet generator uses, so a problem
+written for either works in both. Tables are ordinary Markdown pipe tables.
+
+- **One layout, two outputs.** A block is parsed and laid out once into a scene: a flat list of
+  paths, dots and labels in pixels (`src/visuals/scene.ts`). The browser draws the scene as SVG
+  with KaTeX labels (`src/components/Visual.tsx`); the worksheet writes the same scene as TikZ
+  (`src/visuals/tikz.ts`). Clipping, arrowheads and label positions are decided before either
+  one sees it, so the screen and the PDF match.
+- **Figures are computed, not sketched.** A triangle given as two angles and a side is solved
+  with the laws of sines and cosines and scaled uniformly, so the picture is true to its numbers.
+- **Expressions are parsed, never evaluated as code.** `src/visuals/expr.ts` tokenises `2x - 3`
+  or `\frac{1}{2}x` and builds a closure. Chat messages go through the same renderer, so this
+  runs on text other people typed.
+- **Claude's blocks are checked on the server.** A line the parser cannot read goes back to
+  Claude once with the parser's own message. If it is still wrong, the rest of the picture is
+  drawn and the card says part of it is missing.
+- **The prompt cannot drift from the parser.** A unit test runs every example in the
+  instructions Claude is given through the parser and fails if one of them would not draw.
 
 ### The worksheet and the recap email
 
@@ -121,10 +157,13 @@ against the real workers. The free test covers joining by name, ink in both dire
 highlighter, select/move/delete/undo, cursor names, typed fractions, chat, and the server
 boundaries (no pass, wrong room, forged cookie, student calling a tutor action). A second free
 test sends the Pointer Events a stylus would (eraser end, side button) and checks erasing, undo,
-selecting and moving on both screens. The opt-in test
-creates a question both ways, grades a boxed wrong answer, uses the tutor's private chat, makes a
-worksheet PDF and opens it without an account, and sends a recap to the mail provider's test
-inbox. `src/server/worksheet.test.ts` unit-tests the Markdown-to-LaTeX conversion.
+selecting and moving on both screens. A third posts a graph, a figure and a table as a chat
+message and checks that both screens draw them. The opt-in tests create a question both ways,
+grade a boxed wrong answer, use the tutor's private chat, make a worksheet PDF and open it without
+an account, send a recap to the mail provider's test inbox, and ask Claude for a geometry question
+and a table-and-graph question to confirm it writes blocks the app can draw.
+`src/visuals/visuals.test.ts` unit-tests the expression parser, graphs, figures and TikZ output;
+`src/server/worksheet.test.ts` the Markdown-to-LaTeX conversion.
 
 ## Tradeoffs and limits
 
@@ -143,6 +182,12 @@ inbox. `src/server/worksheet.test.ts` unit-tests the Markdown-to-LaTeX conversio
   the same stroke at once will see one of them win.
 - **Grading depends on reading handwriting from an image.** Typed answers are exact; messy ink can
   be misread, and the prompt asks Claude to say so when it is unsure.
+- **Visuals cover the common cases, not everything.** Graphs of functions and inequalities,
+  points and simple shapes on a plane, and plane geometry figures with their marks. There are no
+  3-D graphs, shaded regions between curves, or solids of revolution, which the TutorAssist
+  generator has. Labels are placed by simple rules and can overlap in a crowded picture.
+- **Anyone in the room can post a graph or figure in chat** by typing a block. That is the same
+  renderer the question cards use, not a separate permission.
 - **Deleting a room removes its record** (the link stops working) but does not clear that room's
   board or chat storage.
 - **A worksheet link is public to anyone who has it.** App-scope files are world-readable, which
