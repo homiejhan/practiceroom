@@ -30,6 +30,8 @@ explanation to the room chat.
 - **Graphs, geometry figures and tables**: a question, its answer key and Claude's explanations
   can include a coordinate-plane graph, a to-scale geometry figure or a table to fill in. They are
   drawn on the board, in the chat and in the worksheet PDF.
+- **Export**: anyone in the room can save the whole board, not just what is on screen, as a PNG
+  or a one-page PDF.
 - **Check a region** (tutor only): box part of the board, and Claude grades only that part against
   the answer key.
 - **Room chat** for everyone, with LaTeX rendering. Claude posts there only when the tutor checks a
@@ -52,6 +54,7 @@ explanation to the room chat.
 | Recap email | `email/send` integration | `src/actions/index.ts` |
 | Graphs, figures and tables | None: a parser and layout of my own, drawn as SVG and as TikZ | `src/visuals/` |
 | Pictures on the board | `appFiles` (app scope); the address is a `CanvasRoom` shape | `src/board/imageUpload.ts`, `src/actions/index.ts` |
+| Export to PNG or PDF | None: drawn in the browser, with `html-to-image` for the cards | `src/board/exportBoard.ts` |
 | Tutor's private assistant | The `ai-chat` feature (`ChatPanel` + `streamDeepSpaceAgent`) | `src/components/room/TutorPanel.tsx` |
 | Signing key for guest passes | The app's secrets store (`GUEST_SECRET`) | `src/server/guest.ts` |
 
@@ -173,8 +176,9 @@ test sends the Pointer Events a stylus would (eraser end, side button) and check
 selecting and moving on both screens. A third covers the eraser tool, the width sliders, and
 two-finger zoom, the last with real touch input through the browser as well as scripted events. A
 fourth uploads and pastes a picture, checks that a student with no account sees it, resizes it,
-writes on it, and confirms the grading capture contains it. A fifth posts a graph, a figure and a
-table as a chat message and checks that both screens draw them. The opt-in tests create a question both ways,
+writes on it, and confirms the grading capture contains it. A fifth fills a board with a picture, a question card, ink, highlighter and typed math, exports it
+as a PNG and as a PDF, and checks each downloaded file for all of it. A sixth posts a graph, a
+figure and a table as a chat message and checks that both screens draw them. The opt-in tests create a question both ways,
 grade a boxed wrong answer, use the tutor's private chat, make a worksheet PDF and open it without
 an account, send a recap to the mail provider's test inbox, and ask Claude for a geometry question
 and a table-and-graph question to confirm it writes blocks the app can draw.
@@ -193,6 +197,10 @@ and a table-and-graph question to confirm it writes blocks the app can draw.
 - **Only the tutor can add, move or remove a picture.** Moving and removing are rules of the
   interface, like question cards. A picture's address is public to anyone who has it, as a
   worksheet link is, and removing it from the board does not delete the stored file.
+- **An export is a picture of the board.** The PDF is one page holding that picture, so its text
+  cannot be selected, and a very large board is scaled down to stay inside the browser's limit on
+  image size. Ink and pictures are drawn directly; typed math and question cards go through an
+  HTML-to-image step, which is the part most likely to differ between browsers.
 - **Touch is one finger to draw, two to zoom and pan.** There is no setting to make one finger
   pan while a stylus draws.
 - **Pen controls are the ones a browser can see.** The eraser end and the side button arrive as

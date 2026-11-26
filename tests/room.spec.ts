@@ -688,6 +688,186 @@ test('a picture on the board: upload, paste, share, resize and grade', async ({ 
   await studentContext.close()
 })
 
+test('the board exports as a PNG and as a PDF, with everything on it', async ({ users, browser }) => {
+  test.setTimeout(120_000)
+  const [tutor] = await users(1)
+  const roomPath = await createRoom(tutor.page, 'Export test: Algebra')
+  const roomId = roomPath.split('/').pop()
+  const studentContext = await browser.newContext()
+  const student = await studentContext.newPage()
+  await joinAsStudent(student, roomPath, 'Maya')
+  const page = tutor.page
+  const exportButton = (target: Page) => target.getByRole('button', { name: 'Export the board' })
+
+  // Nothing on the board: there is nothing to save, and it says so.
+  await exportButton(page).click()
+  await page.getByRole('menuitem', { name: 'PNG image' }).click()
+  await expect(page.getByText('Nothing to export yet')).toBeVisible()
+
+  // One of everything. A picture, under the rest:
+  const pngBase64 = await page.evaluate(() => {
+    const canvas = document.createElement('canvas')
+    canvas.width = 480
+    canvas.height = 200
+    const ctx = canvas.getContext('2d')!
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, 480, 200)
+    ctx.fillStyle = '#7c3aed'
+    ctx.fillRect(20, 20, 440, 60)
+    return canvas.toDataURL('image/png').split(',')[1]
+  })
+  await page.getByTestId('image-input').setInputFiles({
+    name: 'homework.png',
+    mimeType: 'image/png',
+    buffer: Buffer.from(pngBase64, 'base64'),
+  })
+  await expect(page.locator('.board-image img')).toHaveCount(1, { timeout: 30_000 })
+  await expect
+    .poll(() => page.locator('.board-image img').evaluate((img: HTMLImageElement) => img.complete && img.naturalWidth > 0))
+    .toBe(true)
+
+  // A question card with a table and a graph in it. Cards are ordinary board
+  // shapes, so one can be added through the board's own sync socket without
+  // asking Claude for a question.
+  const questionText = [
+    'Complete the table for $y = 2x - 1$, then graph it.',
+    '| $x$ | $0$ | $1$ |',
+    '|:---:|:---:|:---:|',
+    '| $y$ |  |  |',
+    '[graph]',
+    'size: small',
+    'x: -5 to 5',
+    'y: -5 to 5',
+    'y = 2x - 1 [label: $f$]',
+    '[/graph]',
+  ].join('\n')
+  await student.evaluate(
+    async ({ roomId, text }) => {
+      const socket = new WebSocket(`${location.origin.replace(/^http/, 'ws')}/ws/canvas/${roomId}`)
+      await new Promise((resolve, reject) => {
+        socket.onopen = resolve
+        socket.onerror = reject
+      })
+      socket.send(
+        JSON.stringify({
+          type: 'canvas.add',
+          payload: {
+            id: crypto.randomUUID(),
+            type: 'question',
+            x: 620,
+            y: -40,
+            width: 380,
+            height: 140,
+            props: { qid: '', title: 'Graph a line', text, n: 1 },
+          },
+        }),
+      )
+      await new Promise((resolve) => setTimeout(resolve, 400))
+      socket.close()
+    },
+    { roomId, text: questionText },
+  )
+  await expect(page.locator('.board-question [data-visual="graph"] svg')).toBeVisible({ timeout: 15_000 })
+
+  // Pen ink in red, highlighter over it, and typed math.
+  const box = await boardBox(page)
+  await page.keyboard.press('4')
+  await page.getByRole('button', { name: 'Red', exact: true }).click()
+  await drawLine(page, box.x + 140, box.y + 430, box.x + 420, box.y + 430)
+  await page.keyboard.press('5')
+  await drawLine(page, box.x + 140, box.y + 440, box.x + 420, box.y + 440)
+  const studentBox = await boardBox(student)
+  await student.keyboard.press('3')
+  await student.mouse.click(studentBox.x + 180, studentBox.y + 520)
+  await expect(student.locator('math-field')).toBeFocused()
+  await student.keyboard.type('x=1/2')
+  await student.keyboard.press('Enter')
+  await expect(page.locator('.board-math .mfrac')).toHaveCount(1, { timeout: 10_000 })
+  // A selection is part of the screen, not the board; it must not show in the file.
+  await page.keyboard.press('2')
+  await page.locator('.board-math').click()
+  await expect(page.getByText('1 selected')).toBeVisible()
+
+  /** Decode an image in the page and count how much of it is each kind of content. */
+  const inspect = (target: Page, dataUrl: string) =>
+    target.evaluate(async (url) => {
+      const image = new Image()
+      image.src = url
+      await image.decode()
+      const canvas = document.createElement('canvas')
+      canvas.width = image.naturalWidth
+      canvas.height = image.naturalHeight
+      const ctx = canvas.getContext('2d')!
+      ctx.drawImage(image, 0, 0)
+      const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height)
+      const count = { white: 0, red: 0, purple: 0, yellowOnRed: 0, teal: 0, navy: 0, dark: 0, selection: 0 }
+      for (let i = 0; i < data.length; i += 4) {
+        const [r, g, b] = [data[i], data[i + 1], data[i + 2]]
+        if (r > 245 && g > 245 && b > 245) count.white++
+        else if (r > 200 && g < 70 && b < 70) count.red++
+        else if (Math.abs(r - 124) < 25 && Math.abs(g - 58) < 25 && Math.abs(b - 237) < 25) count.purple++
+        else if (Math.abs(r - 15) < 25 && Math.abs(g - 107) < 25 && Math.abs(b - 92) < 25) count.teal++
+        else if (Math.abs(r - 25) < 22 && Math.abs(g - 70) < 22 && Math.abs(b - 140) < 22) count.navy++
+        else if (r < 70 && g < 70 && b < 70) count.dark++
+      }
+      return { width: canvas.width, height: canvas.height, count }
+    }, dataUrl)
+
+  // --- PNG, from the tutor ---
+  await exportButton(page).click()
+  const [pngDownload] = await Promise.all([
+    page.waitForEvent('download'),
+    page.getByRole('menuitem', { name: 'PNG image' }).click(),
+  ])
+  expect(pngDownload.suggestedFilename()).toMatch(/^export-test-algebra-\d{4}-\d{2}-\d{2}\.png$/)
+  const fs = await import('node:fs')
+  const png = fs.readFileSync((await pngDownload.path())!)
+  if (SHOT_DIR) fs.writeFileSync(path.join(SHOT_DIR, 'board-export.png'), png)
+  expect(png.subarray(0, 8).toString('hex')).toBe('89504e470d0a1a0a')
+  const pngInfo = await inspect(page, `data:image/png;base64,${png.toString('base64')}`)
+  // The whole board at twice its on-screen size: well over a thousand pixels each way.
+  expect(pngInfo.width).toBeGreaterThan(1500)
+  expect(pngInfo.height).toBeGreaterThan(900)
+  const area = pngInfo.width * pngInfo.height
+  expect(pngInfo.count.white / area).toBeGreaterThan(0.5)
+  expect(pngInfo.count.red).toBeGreaterThan(1500) // the pen stroke
+  expect(pngInfo.count.purple).toBeGreaterThan(20_000) // the picture
+  expect(pngInfo.count.teal).toBeGreaterThan(400) // the question card's edge
+  expect(pngInfo.count.navy).toBeGreaterThan(150) // the graph's line, inside the card
+  expect(pngInfo.count.dark).toBeGreaterThan(1500) // text and math
+  // Exporting cleared the selection on screen as well.
+  await expect(page.getByText('1 selected')).toHaveCount(0)
+
+  // --- PDF, from the student: anyone in the room can save the board ---
+  await exportButton(student).click()
+  const [pdfDownload] = await Promise.all([
+    student.waitForEvent('download'),
+    student.getByRole('menuitem', { name: 'PDF document' }).click(),
+  ])
+  expect(pdfDownload.suggestedFilename()).toMatch(/^export-test-algebra-\d{4}-\d{2}-\d{2}\.pdf$/)
+  const pdf = fs.readFileSync((await pdfDownload.path())!)
+  if (SHOT_DIR) fs.writeFileSync(path.join(SHOT_DIR, 'board-export.pdf'), pdf)
+  const pdfText = pdf.toString('latin1')
+  expect(pdfText.startsWith('%PDF-1.4')).toBe(true)
+  expect(pdfText.trimEnd().endsWith('%%EOF')).toBe(true)
+  // One page shaped like the board, holding one JPEG with the same content.
+  const [, pageWidth, pageHeight] = /\/MediaBox \[0 0 ([\d.]+) ([\d.]+)\]/.exec(pdfText)!.map(Number)
+  const [, imageWidth, imageHeight, imageLength] = /\/Width (\d+) \/Height (\d+) .*?\/Length (\d+)/
+    .exec(pdfText)!
+    .map(Number)
+  expect(pageWidth / pageHeight).toBeCloseTo(imageWidth / imageHeight, 2)
+  const jpegStart = pdfText.indexOf('stream\n', pdfText.indexOf('/DCTDecode')) + 'stream\n'.length
+  const jpeg = pdf.subarray(jpegStart, jpegStart + imageLength)
+  expect(jpeg.subarray(0, 3).toString('hex')).toBe('ffd8ff')
+  const pdfInfo = await inspect(student, `data:image/jpeg;base64,${jpeg.toString('base64')}`)
+  expect([pdfInfo.width, pdfInfo.height]).toEqual([imageWidth, imageHeight])
+  expect(pdfInfo.count.purple).toBeGreaterThan(20_000)
+  expect(pdfInfo.count.red).toBeGreaterThan(1000)
+  expect(pdfInfo.count.dark).toBeGreaterThan(1500)
+
+  await studentContext.close()
+})
+
 test('graphs, figures and tables written in text are drawn for everyone', async ({ users, browser }) => {
   test.setTimeout(90_000)
   const [tutor] = await users(1)

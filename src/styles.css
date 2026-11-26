@@ -304,6 +304,8 @@
 .board-resize { position: absolute; width: 14px; height: 14px; margin: -7px 0 0 -7px; border-radius: 3px; background: #ffffff; border: 2px solid var(--color-primary); cursor: nwse-resize; z-index: 5; touch-action: none; }
 
 .board-world { position: absolute; left: 0; top: 0; width: 0; height: 0; transform-origin: 0 0; }
+/* Typed math and question cards, grouped so an export can copy them as one. */
+.board-items { position: absolute; left: 0; top: 0; width: 0; height: 0; }
 .board-svg { position: absolute; left: 0; top: 0; width: 1px; height: 1px; overflow: visible; pointer-events: none; }
 .board-stroke-selected { fill: none; stroke: rgba(15, 107, 92, 0.3); stroke-linecap: round; stroke-linejoin: round; }
 

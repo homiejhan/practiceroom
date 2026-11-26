@@ -11,13 +11,23 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { AuthOverlay, getUserColor, useAuth } from 'deepspace'
-import { Check, Link2, MessageSquare, PanelLeft } from 'lucide-react'
+import { Check, Download, Link2, LoaderCircle, MessageSquare, PanelLeft } from 'lucide-react'
 import { Board, type BoardHandle, type BoardPeer, type UploadedImage } from '@/board/Board'
+import type { ExportFormat } from '@/board/exportBoard'
 import { prepareImage } from '@/board/imageUpload'
 import type { RegionCapture } from '@/board/renderRegion'
 import { RoomChat } from '@/components/room/RoomChat'
 import { TutorPanel } from '@/components/room/TutorPanel'
-import { Button, Input, Label, useToast } from '@/components/ui'
+import {
+  Button,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  Input,
+  Label,
+  useToast,
+} from '@/components/ui'
 import { APP_DISPLAY_NAME } from '@/constants'
 import { callAction, roomRequest, type Me, type RoomInfo } from '@/lib/api'
 import { cn } from '@/lib/utils'
@@ -203,6 +213,7 @@ function RoomView({ info, me }: { info: RoomInfo; me: Me }) {
   const [messageCount, setMessageCount] = useState<number | null>(null)
   const [seenCount, setSeenCount] = useState(0)
   const [copied, setCopied] = useState(false)
+  const [exporting, setExporting] = useState(false)
 
   // Everything already in the chat when the room opens counts as seen.
   const onCount = useCallback((count: number) => {
@@ -255,6 +266,20 @@ function RoomView({ info, me }: { info: RoomInfo; me: Me }) {
     [roomId, toast],
   )
 
+  // The whole board, not just what is on screen, saved to this device.
+  const exportBoard = async (format: ExportFormat) => {
+    if (exporting) return
+    setExporting(true)
+    try {
+      const saved = await boardRef.current?.exportAs(format, info.title)
+      if (saved === false) toast.info('Nothing to export yet', 'The board is empty.')
+    } catch {
+      toast.error('The board could not be exported', 'Try again, or try the other format.')
+    } finally {
+      setExporting(false)
+    }
+  }
+
   const copyLink = async () => {
     try {
       await navigator.clipboard.writeText(`${window.location.origin}/r/${roomId}`)
@@ -303,6 +328,25 @@ function RoomView({ info, me }: { info: RoomInfo; me: Me }) {
             </li>
           )}
         </ul>
+
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            render={
+              <Button variant="outline" size="sm" disabled={exporting} aria-label="Export the board">
+                {exporting ? (
+                  <LoaderCircle className="animate-spin" aria-hidden="true" />
+                ) : (
+                  <Download aria-hidden="true" />
+                )}
+                <span className="max-sm:sr-only">{exporting ? 'Exporting' : 'Export'}</span>
+              </Button>
+            }
+          />
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem onClick={() => void exportBoard('png')}>PNG image</DropdownMenuItem>
+            <DropdownMenuItem onClick={() => void exportBoard('pdf')}>PDF document</DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
 
         <Button variant="outline" size="sm" onClick={copyLink}>
           {copied ? <Check aria-hidden="true" /> : <Link2 aria-hidden="true" />}

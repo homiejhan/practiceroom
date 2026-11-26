@@ -36,6 +36,7 @@
     "deepspace": "0.44.2",
     "highlight.js": "^11.10.0",
     "hono": "^4.13.7",
+    "html-to-image": "1.11.13",
     "katex": "^0.19.1",
     "lucide-react": "^0.460.0",
     "mathlive": "^0.111.4",

@@ -54,6 +54,14 @@ import {
 } from 'lucide-react'
 import { Markdown } from '@/components/Markdown'
 import { cn } from '@/lib/utils'
+import {
+  contentBounds,
+  exportBlob,
+  exportFileName,
+  renderBoard,
+  saveBlob,
+  type ExportFormat,
+} from './exportBoard'
 import { sweepTouchesStroke, type Point } from './hit'
 import { imageFiles } from './imageUpload'
 import { MathEditor, type MathCommit } from './MathEditor'
@@ -94,6 +102,11 @@ export interface BoardPeer {
 export interface BoardHandle {
   /** Put a generated question on the board, below the last one. */
   addQuestion: (question: { questionId: string; title: string; text: string }) => void
+  /**
+   * Save everything on the board as a PNG or a PDF, named after `title`.
+   * Resolves false when there is nothing on the board to save.
+   */
+  exportAs: (format: ExportFormat, title: string) => Promise<boolean>
 }
 
 /** A picture after upload: where it is stored and its size in pixels. */
@@ -416,6 +429,8 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
   /** Fingers currently on the board, by pointer id, in screen pixels. */
   const touches = useRef(new Map<number, Point>())
   const fileInput = useRef<HTMLInputElement>(null)
+  /** Wraps the typed math and question cards: the part of an export that is HTML. */
+  const itemsLayer = useRef<HTMLDivElement>(null)
   const draft = useRef<number[]>([])
   const draftFrame = useRef(0)
   const cursorFrame = useRef(0)
@@ -594,6 +609,15 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
     [toWorld],
   )
 
+  /** The <img> on screen for a picture shape: what a capture or an export draws from. */
+  const pictureOf = useCallback(
+    (shape: Shape) =>
+      containerRef.current?.querySelector<HTMLImageElement>(
+        `[data-shape-id="${CSS.escape(shape.id)}"] img`,
+      ) ?? null,
+    [],
+  )
+
   // --- Presence ------------------------------------------------------------
 
   useEffect(() => {
@@ -653,8 +677,22 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
           }
         }
       },
+      async exportAs(format, title) {
+        // Selection outlines belong to the screen, not to the board: clear
+        // them and let that paint before the cards are copied.
+        setSelection(new Set())
+        await new Promise<void>((resolve) => {
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+        })
+        const shapes = allRef.current
+        const bounds = contentBounds(shapes, measure)
+        if (!bounds) return false
+        const canvas = await renderBoard({ shapes, bounds, items: itemsLayer.current, pictureOf })
+        saveBlob(await exportBlob(canvas, bounds, format), exportFileName(title, format))
+        return true
+      },
     }),
-    [addLocal, measure, setView],
+    [addLocal, measure, pictureOf, setView],
   )
 
   // --- Editing math --------------------------------------------------------
@@ -1360,11 +1398,6 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
 
   const runCheck = async () => {
     if (!region || !onCheck || checking) return
-    // Pictures are drawn into the capture from the <img> already on screen.
-    const pictureOf = (shape: Shape) =>
-      containerRef.current?.querySelector<HTMLImageElement>(
-        `[data-shape-id="${CSS.escape(shape.id)}"] img`,
-      ) ?? null
     const capture = captureRegion(region, allRef.current, measure, pictureOf)
     if (!capture) return
     setChecking(true)
@@ -1433,12 +1466,14 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
           selected={selection}
           hittable={isTutor && tool === 'select' && !panCursor}
         />
-        <ItemLayer
-          items={items}
-          selected={selection}
-          hittable={hittable && !panCursor}
-          editingId={editor?.id ?? null}
-        />
+        <div ref={itemsLayer} className="board-items">
+          <ItemLayer
+            items={items}
+            selected={selection}
+            hittable={hittable && !panCursor}
+            editingId={editor?.id ?? null}
+          />
+        </div>
         <StrokeLayer
           strokes={penStrokes}
           selected={selection}
