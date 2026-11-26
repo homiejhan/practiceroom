@@ -15,8 +15,11 @@ export const CLAUDE_MODEL = 'claude-opus-5-5'
 type TextBlock = { type: 'text'; text: string }
 type ImageBlock = {
   type: 'image'
-  source: { type: 'base64'; media_type: 'image/png'; data: string }
+  source: { type: 'base64'; media_type: RegionImageType; data: string }
 }
+
+/** The region capture is a PNG, or a JPEG when it has a photograph in it. */
+export type RegionImageType = 'image/png' | 'image/jpeg'
 type ContentBlock = TextBlock | ImageBlock
 
 interface ClaudeMessage {
@@ -351,6 +354,7 @@ const GRADING_SYSTEM = [
   '- An image of the region. Pen and highlighter strokes appear as drawn: this is handwriting, usually the student working a problem or writing an answer.',
   '- Typed math entries do not appear as rendered math in the image. Each shows as a small box labelled [T1], [T2], ... where it sits on the board, and its LaTeX is listed in the text below.',
   '- Question cards show as boxes labelled [Q1], [Q2], ... and their full text is listed below, with the tutor\'s private answer key when one exists.',
+  '- Pictures the tutor placed on the board (a photo or screenshot of a problem, often from homework) appear in the image exactly as they are, with any writing over them. A problem shown in a picture is a question to grade like any other: read it from the picture. It has no answer key.',
   '- Positions (x, y in image pixels, origin top-left) for every labelled item, so you can tell which answer belongs to which question: an answer normally sits beside or below its question.',
   '',
   'For each question in the region:',
@@ -379,6 +383,8 @@ const GRADING_SYSTEM = [
 
 export function gradingRequest(input: {
   imageBase64: string
+  imageType: RegionImageType
+  imageCount: number
   width: number
   height: number
   questions: RegionQuestion[]
@@ -388,6 +394,7 @@ export function gradingRequest(input: {
   const lines: string[] = [
     `Region image size: ${input.width} x ${input.height} px.`,
     `Handwritten strokes in the region: ${input.strokeCount}.`,
+    `Pictures in the region: ${input.imageCount}.`,
     '',
   ]
 
@@ -418,7 +425,7 @@ export function gradingRequest(input: {
     content: [
       {
         type: 'image',
-        source: { type: 'base64', media_type: 'image/png', data: input.imageBase64 },
+        source: { type: 'base64', media_type: input.imageType, data: input.imageBase64 },
       },
       { type: 'text', text: lines.join('\n') },
     ],

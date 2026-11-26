@@ -12,8 +12,13 @@ explanation to the room chat.
 
 ## What it does
 
-- **Shared whiteboard** with five tools: move around, select, type math, pen (nine colors), and
-  highlighter (six neon colors). Plus undo/redo and zoom.
+- **Shared whiteboard** with six tools: move around, select, type math, pen (nine colors),
+  highlighter (six neon colors) and eraser. The pen, highlighter and eraser each have an adjustable
+  width, remembered on your device. Plus undo/redo and zoom, including a two-finger pinch on a
+  tablet.
+- **Pictures** (tutor only): put a screenshot or a photo of a homework problem on the board by
+  picking a file, pasting it, or dropping it in. It sits under the ink, so both people can write
+  on it, and it is part of what Claude sees when the tutor checks a region.
 - **Stylus hardware**: a pen's eraser end erases ink and its side button selects, under whichever
   tool is active. Flip the pen back over and it carries on with that tool.
 - **Math typing that behaves like Desmos**: `/` makes a fraction, `^` an exponent, `sqrt` a
@@ -46,6 +51,7 @@ explanation to the room chat.
 | Worksheet PDF | `latex-compiler/compile` integration, stored with `appFiles` | `src/server/worksheet.ts` |
 | Recap email | `email/send` integration | `src/actions/index.ts` |
 | Graphs, figures and tables | None: a parser and layout of my own, drawn as SVG and as TikZ | `src/visuals/` |
+| Pictures on the board | `appFiles` (app scope); the address is a `CanvasRoom` shape | `src/board/imageUpload.ts`, `src/actions/index.ts` |
 | Tutor's private assistant | The `ai-chat` feature (`ChatPanel` + `streamDeepSpaceAgent`) | `src/components/room/TutorPanel.tsx` |
 | Signing key for guest passes | The app's secrets store (`GUEST_SECRET`) | `src/server/guest.ts` |
 
@@ -70,14 +76,21 @@ browser edits fails the signature check.
   stamps the verified author name, so nobody can post as someone else or forge a grading result.
 - **Each room's chat is its own record scope**, so reading it requires knowing the room id. One
   shared collection with a public read rule would have exposed every room's chat.
-- **Tutor actions** (generate, check) verify that the caller owns the room before reading a key or
-  spending a paid call.
+- **Tutor actions** (generate, check, add a picture) verify that the caller owns the room before
+  reading a key, spending a paid call or storing a file.
+- **Pictures** are scaled down and re-encoded in the tutor's browser, so only plain PNG or JPEG
+  bytes reach storage, and each tutor has a daily allowance. Shape data is written by anyone in
+  the room, so a picture is only ever shown if its address is one of this app's own files
+  (`boardImageSrc` in `src/board/types.ts`); a crafted shape cannot make other people's browsers
+  fetch an outside URL.
 
 ### How a check works
 
 The tutor's browser turns the boxed rectangle into two things (`src/board/renderRegion.ts`):
-a PNG of the ink, and the typed entries and question cards inside the box as data. Ink has to be
-an image because handwriting can only be read from pixels. Typed math is sent as its exact LaTeX
+an image of the ink, and the typed entries and question cards inside the box as data. Ink has to
+be an image because handwriting can only be read from pixels. A picture the tutor placed is drawn
+into that image under the ink, so a photographed problem and the answer written on it are graded
+together. Typed math is sent as its exact LaTeX
 and appears in the image only as a labelled placeholder, which is more reliable than asking a
 vision model to re-read rendered math. The worker attaches the private answer keys, calls Claude,
 and posts the result to the room chat.
@@ -157,8 +170,11 @@ against the real workers. The free test covers joining by name, ink in both dire
 highlighter, select/move/delete/undo, cursor names, typed fractions, chat, and the server
 boundaries (no pass, wrong room, forged cookie, student calling a tutor action). A second free
 test sends the Pointer Events a stylus would (eraser end, side button) and checks erasing, undo,
-selecting and moving on both screens. A third posts a graph, a figure and a table as a chat
-message and checks that both screens draw them. The opt-in tests create a question both ways,
+selecting and moving on both screens. A third covers the eraser tool, the width sliders, and
+two-finger zoom, the last with real touch input through the browser as well as scripted events. A
+fourth uploads and pastes a picture, checks that a student with no account sees it, resizes it,
+writes on it, and confirms the grading capture contains it. A fifth posts a graph, a figure and a
+table as a chat message and checks that both screens draw them. The opt-in tests create a question both ways,
 grade a boxed wrong answer, use the tutor's private chat, make a worksheet PDF and open it without
 an account, send a recap to the mail provider's test inbox, and ask Claude for a geometry question
 and a table-and-graph question to confirm it writes blocks the app can draw.
@@ -174,6 +190,11 @@ and a table-and-graph question to confirm it writes blocks the app can draw.
   access, so a student can move or delete anyone's ink. Question cards are locked to the tutor in
   the UI only.
 - **Ink appears to others when a stroke ends**, not while it is being drawn.
+- **Only the tutor can add, move or remove a picture.** Moving and removing are rules of the
+  interface, like question cards. A picture's address is public to anyone who has it, as a
+  worksheet link is, and removing it from the board does not delete the stored file.
+- **Touch is one finger to draw, two to zoom and pan.** There is no setting to make one finger
+  pan while a stylus draws.
 - **Pen controls are the ones a browser can see.** The eraser end and the side button arrive as
   Pointer Events (`src/board/penInput.ts`). A Surface pen's top-button click and an Apple Pencil's
   double-tap go to the operating system, not to web pages. The eraser removes whole strokes, and

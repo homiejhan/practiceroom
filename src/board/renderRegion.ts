@@ -1,8 +1,11 @@
 /**
- * Turn one rectangle of the whiteboard into what the grader needs: a PNG of
- * the ink, plus the typed entries and question cards inside the rectangle.
+ * Turn one rectangle of the whiteboard into what the grader needs: an image
+ * of the ink and any pictures, plus the typed entries and question cards
+ * inside the rectangle.
  *
- * Ink is drawn for real, because handwriting can only be read from pixels.
+ * Ink is drawn for real, because handwriting can only be read from pixels. A
+ * picture the tutor placed (a photo of a homework problem, say) is drawn too,
+ * under the ink, exactly as it sits on the board.
  * Typed math and question cards are not rasterized: each becomes a labelled
  * placeholder box in the image and its exact LaTeX/text travels as data, which
  * is more reliable than asking a vision model to re-read rendered math.
@@ -10,6 +13,7 @@
 
 import {
   HIGHLIGHTER_OPACITY,
+  boardImageSrc,
   mathProps,
   questionProps,
   rectsOverlap,
@@ -24,6 +28,8 @@ export interface RegionCapture {
   width: number
   height: number
   strokeCount: number
+  /** Pictures drawn into the image. */
+  imageCount: number
   questions: Array<{ questionId: string; text: string; x: number; y: number }>
   typed: Array<{ latex: string; x: number; y: number }>
 }
@@ -54,11 +60,13 @@ function drawTag(ctx: CanvasRenderingContext2D, label: string, box: Rect, color:
  * @param shapes  Every shape on the board, in creation order.
  * @param measure Live on-screen size of an HTML shape, in world units. Cards
  *                grow with their text, so the stored size can lag the real one.
+ * @param pictureOf The loaded <img> showing a picture shape, if it is on screen.
  */
 export function captureRegion(
   region: Rect,
   shapes: Shape[],
   measure: (shape: Shape) => Rect,
+  pictureOf: (shape: Shape) => HTMLImageElement | null = () => null,
 ): RegionCapture | null {
   const scale = Math.min(MAX_SCALE, MAX_SIDE / Math.max(region.w, region.h))
   const width = Math.max(64, Math.round(region.w * scale))
@@ -87,8 +95,20 @@ export function captureRegion(
     width,
     height,
     strokeCount: 0,
+    imageCount: 0,
     questions: [],
     typed: [],
+  }
+
+  // Pictures first: everything else on the board is on top of them.
+  for (const shape of shapes) {
+    if (shape.type !== 'image' || !boardImageSrc(shape)) continue
+    if (!rectsOverlap(shapeRect(shape), region)) continue
+    const picture = pictureOf(shape)
+    if (!picture || !picture.complete || !picture.naturalWidth) continue
+    const box = toImage(shapeRect(shape))
+    ctx.drawImage(picture, box.x, box.y, box.w, box.h)
+    capture.imageCount += 1
   }
 
   for (const shape of shapes) {
@@ -114,6 +134,7 @@ export function captureRegion(
       continue
     }
 
+    if (shape.type === 'image') continue
     const rect = measure(shape)
     if (!rectsOverlap(rect, region)) continue
     const box = toImage(rect)
@@ -135,6 +156,10 @@ export function captureRegion(
     }
   }
 
-  capture.image = canvas.toDataURL('image/png')
+  // Line art is smallest and sharpest as PNG. A photograph is several times
+  // larger that way, so a capture with a picture in it goes as JPEG.
+  capture.image = capture.imageCount
+    ? canvas.toDataURL('image/jpeg', 0.9)
+    : canvas.toDataURL('image/png')
   return capture
 }

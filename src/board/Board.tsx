@@ -1,14 +1,16 @@
 /**
  * The shared whiteboard.
  *
- * Shapes (ink strokes, typed math, question cards) live in the room's
- * CanvasRoom through `useCanvas`; cursors and the tutor's check box travel
- * through the room's PresenceRoom through `usePresenceRoom`. This component
- * adds the tools on top: pan, select, type, pen, highlighter, and (tutor only)
- * the region box that Claude grades.
+ * Shapes (ink strokes, typed math, question cards, pictures) live in the
+ * room's CanvasRoom through `useCanvas`; cursors and the tutor's check box
+ * travel through the room's PresenceRoom through `usePresenceRoom`. This
+ * component adds the tools on top: pan, select, type, pen, highlighter,
+ * eraser, and (tutor only) pictures and the region box that Claude grades.
  *
  * A stylus's hardware controls work under any tool (see `penInput.ts`): its
  * eraser end erases ink and its side button selects, each for one gesture.
+ * Two fingers always pinch to zoom and slide to pan, whatever tool is
+ * selected; a palm that lands while a pen is writing is ignored.
  *
  * Three pieces of local state paper over how CanvasRoom echoes writes:
  * - `pending`: a new shape is drawn immediately and dropped once the server's
@@ -35,8 +37,10 @@ import {
 } from 'react'
 import { getUserColor, useCanvas, usePresenceRoom } from 'deepspace'
 import {
+  Eraser,
   Hand,
   Highlighter,
+  ImagePlus,
   LoaderCircle,
   Minus,
   MousePointer2,
@@ -51,6 +55,7 @@ import {
 import { Markdown } from '@/components/Markdown'
 import { cn } from '@/lib/utils'
 import { sweepTouchesStroke, type Point } from './hit'
+import { imageFiles } from './imageUpload'
 import { MathEditor, type MathCommit } from './MathEditor'
 import { renderLatex } from './math'
 import { penBind } from './penInput'
@@ -58,13 +63,16 @@ import { captureRegion, type RegionCapture } from './renderRegion'
 import {
   HIGHLIGHTER_COLORS,
   HIGHLIGHTER_OPACITY,
-  HIGHLIGHTER_SIZE,
   MATH_FONT_SIZE,
   PEN_COLORS,
-  PEN_SIZES,
   QUESTION_CARD_WIDTH,
+  WIDTHS,
+  boardImageSrc,
   mathProps,
+  pinchView,
   questionProps,
+  readWidths,
+  rectContains,
   rectFromPoints,
   rectsOverlap,
   shapeRect,
@@ -73,7 +81,9 @@ import {
   type Rect,
   type Shape,
   type Tool,
+  type ToolWidths,
   type View,
+  type WidthTool,
 } from './types'
 
 export interface BoardPeer {
@@ -86,6 +96,13 @@ export interface BoardHandle {
   addQuestion: (question: { questionId: string; title: string; text: string }) => void
 }
 
+/** A picture after upload: where it is stored and its size in pixels. */
+export interface UploadedImage {
+  src: string
+  width: number
+  height: number
+}
+
 interface BoardProps {
   roomId: string
   myUserId: string
@@ -93,6 +110,8 @@ interface BoardProps {
   isTutor: boolean
   /** Grade the captured region. Resolves true when the result was posted. */
   onCheck?: (capture: RegionCapture) => Promise<boolean>
+  /** Upload a picture for the board. Resolves null when it could not be added. */
+  onAddImage?: (file: File) => Promise<UploadedImage | null>
   onPeers?: (peers: BoardPeer[]) => void
 }
 
@@ -100,6 +119,8 @@ interface Patch {
   base: Shape
   x?: number
   y?: number
+  width?: number
+  height?: number
   props?: Record<string, unknown>
 }
 
@@ -118,17 +139,32 @@ type Gesture =
   | { kind: 'marquee'; startX: number; startY: number }
   | { kind: 'region'; startX: number; startY: number }
   | { kind: 'type'; startX: number; startY: number; hitId: string | null }
-  /** The pen's eraser end. `x`/`y` is the last sample, in world space. */
-  | { kind: 'erase'; x: number; y: number }
+  /**
+   * The eraser tool, or a pen's eraser end. `x`/`y` is the last sample in
+   * world space. A finger only starts erasing once it has moved (`armed`), so
+   * the first finger of a pinch cannot rub something out.
+   */
+  | { kind: 'erase'; x: number; y: number; armed: boolean; downX: number; downY: number }
+  /** Two fingers: where they started, and the view at that moment. */
+  | { kind: 'pinch'; ids: [number, number]; mid: Point; distance: number; view: View }
+  /** Dragging a picture's corner. Sizes are the picture's when the drag began. */
+  | { kind: 'resize'; id: string; startX: number; startY: number; width: number; height: number }
 
 const MIN_ZOOM = 0.25
 const MAX_ZOOM = 4
 const DOUBLE_CLICK_MS = 350
 const QUESTION_GAP = 280
-/** Screen pixels, so the eraser feels the same size at any zoom. */
-const ERASER_RADIUS = 10
+/** Where each person's chosen tool widths are kept between visits, on their own device. */
+const WIDTHS_KEY = 'practiceroom:widths'
 /** How close (in screen pixels) a pen-button tap must be to ink to select it. */
 const TAP_REACH = 9
+/** How far a finger moves (screen pixels) before the eraser starts erasing. */
+const TOUCH_ERASE_SLOP = 8
+/** A pen that has sent nothing for this long has left the board; stop ignoring fingers. */
+const PEN_IDLE_MS = 1500
+/** A new picture is shown at most this wide, in board units. */
+const IMAGE_START_WIDTH = 520
+const IMAGE_MIN_WIDTH = 48
 
 const clamp = (value: number, min: number, max: number): number =>
   Math.min(max, Math.max(min, value))
@@ -207,6 +243,45 @@ const StrokeLayer = memo(function StrokeLayer({
   )
 })
 
+/**
+ * Pictures sit under everything else, so they can be written on. Only the
+ * tutor can pick them up; for a student they are part of the background.
+ */
+const ImageLayer = memo(function ImageLayer({
+  images,
+  selected,
+  hittable,
+}: {
+  images: Shape[]
+  selected: Set<string>
+  hittable: boolean
+}) {
+  return (
+    <>
+      {images.map((shape) => {
+        const src = boardImageSrc(shape)
+        if (!src) return null
+        return (
+          <div
+            key={shape.id}
+            data-shape-id={shape.id}
+            className={cn('board-image', selected.has(shape.id) && 'is-selected')}
+            style={{
+              left: shape.x,
+              top: shape.y,
+              width: shape.width,
+              height: shape.height,
+              pointerEvents: hittable ? 'auto' : 'none',
+            }}
+          >
+            <img src={src} alt="Picture on the board" draggable={false} decoding="async" />
+          </div>
+        )
+      })}
+    </>
+  )
+})
+
 const ItemLayer = memo(function ItemLayer({
   items,
   selected,
@@ -272,11 +347,21 @@ const ItemLayer = memo(function ItemLayer({
 // ---------------------------------------------------------------------------
 
 export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
-  { roomId, myUserId, ownerId, isTutor, onCheck, onPeers },
+  { roomId, myUserId, ownerId, isTutor, onCheck, onAddImage, onPeers },
   ref,
 ) {
-  const { shapes, connected, canWrite, addShape, moveShape, updateShape, deleteShape, undo, redo } =
-    useCanvas(roomId)
+  const {
+    shapes,
+    connected,
+    canWrite,
+    addShape,
+    moveShape,
+    resizeShape,
+    updateShape,
+    deleteShape,
+    undo,
+    redo,
+  } = useCanvas(roomId)
   const { peers, updateState } = usePresenceRoom(roomId)
 
   const containerRef = useRef<HTMLDivElement>(null)
@@ -289,7 +374,26 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
 
   const [tool, setTool] = useState<Tool>('pen')
   const [penColor, setPenColor] = useState(PEN_COLORS[0].value)
-  const [penSize, setPenSize] = useState<number>(PEN_SIZES[1])
+  // Pen, highlighter and eraser widths. Remembered on this device; a browser
+  // that refuses storage simply starts from the defaults each time.
+  const [widths, setWidths] = useState<ToolWidths>(() => {
+    try {
+      return readWidths(JSON.parse(localStorage.getItem(WIDTHS_KEY) ?? 'null'))
+    } catch {
+      return readWidths(null)
+    }
+  })
+  useEffect(() => {
+    try {
+      localStorage.setItem(WIDTHS_KEY, JSON.stringify(widths))
+    } catch {
+      // Private windows and blocked storage: the widths last for this visit.
+    }
+  }, [widths])
+  const setWidth = useCallback(
+    (which: WidthTool, value: number) => setWidths((prev) => ({ ...prev, [which]: value })),
+    [],
+  )
   const [highlightColor, setHighlightColor] = useState(HIGHLIGHTER_COLORS[2].value)
 
   const [pending, setPending] = useState<Shape[]>([])
@@ -303,8 +407,15 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
   const [editor, setEditor] = useState<EditorState | null>(null)
   const [draftTick, setDraftTick] = useState(0)
   const [spaceHeld, setSpaceHeld] = useState(false)
+  const [resizing, setResizing] = useState<{ id: string; width: number; height: number } | null>(null)
+  const [uploading, setUploading] = useState(0)
 
   const gesture = useRef<Gesture | null>(null)
+  // Which pointer owns the gesture, so a second one cannot end or steer it.
+  const activePointer = useRef<{ id: number; type: string; at: number } | null>(null)
+  /** Fingers currently on the board, by pointer id, in screen pixels. */
+  const touches = useRef(new Map<number, Point>())
+  const fileInput = useRef<HTMLInputElement>(null)
   const draft = useRef<number[]>([])
   const draftFrame = useRef(0)
   const cursorFrame = useRef(0)
@@ -334,6 +445,8 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
         ...shape,
         x: patch.x ?? shape.x,
         y: patch.y ?? shape.y,
+        width: patch.width ?? shape.width,
+        height: patch.height ?? shape.height,
         props: patch.props ? { ...shape.props, ...patch.props } : shape.props,
       })
     }
@@ -375,12 +488,16 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
     })
   }, [hookById])
 
+  // What is on screen right now: the synced shapes with any drag or resize in
+  // progress applied, before it has been sent.
   const visible = useMemo(() => {
-    if (!drag) return all
-    return all.map((shape) =>
-      drag.ids.has(shape.id) ? { ...shape, x: shape.x + drag.dx, y: shape.y + drag.dy } : shape,
-    )
-  }, [all, drag])
+    if (!drag && !resizing) return all
+    return all.map((shape) => {
+      if (drag?.ids.has(shape.id)) return { ...shape, x: shape.x + drag.dx, y: shape.y + drag.dy }
+      if (resizing?.id === shape.id) return { ...shape, width: resizing.width, height: resizing.height }
+      return shape
+    })
+  }, [all, drag, resizing])
 
   const penStrokes = useMemo(
     () => visible.filter((s) => s.type === 'stroke' && !strokeProps(s).hl),
@@ -390,7 +507,11 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
     () => visible.filter((s) => s.type === 'stroke' && strokeProps(s).hl),
     [visible],
   )
-  const items = useMemo(() => visible.filter((s) => s.type !== 'stroke'), [visible])
+  const images = useMemo(() => visible.filter((s) => s.type === 'image'), [visible])
+  const items = useMemo(
+    () => visible.filter((s) => s.type !== 'stroke' && s.type !== 'image'),
+    [visible],
+  )
 
   const patchShape = useCallback(
     (id: string, change: Omit<Patch, 'base'>) => {
@@ -459,7 +580,9 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
   const measure = useCallback(
     (shape: Shape): Rect => {
       if (shape.type === 'stroke') return shapeRect(shape)
-      const element = containerRef.current?.querySelector(`[data-shape-id="${shape.id}"]`)
+      const element = containerRef.current?.querySelector(
+        `[data-shape-id="${CSS.escape(shape.id)}"]`,
+      )
       if (element) {
         const box = element.getBoundingClientRect()
         const topLeft = toWorld(box.left, box.top)
@@ -579,8 +702,11 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
 
   // --- Pointer gestures ----------------------------------------------------
 
+  // Question cards and pictures are the tutor's to move or remove. CanvasRoom
+  // has no per-shape permissions, so this is a rule of the interface only.
   const canMove = useCallback(
-    (shape: Shape | undefined): boolean => !!shape && (isTutor || shape.type !== 'question'),
+    (shape: Shape | undefined): boolean =>
+      !!shape && (isTutor || (shape.type !== 'question' && shape.type !== 'image')),
     [isTutor],
   )
 
@@ -613,12 +739,12 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
         props: {
           pts,
           color: highlighter ? highlightColor : penColor,
-          size: highlighter ? HIGHLIGHTER_SIZE : penSize,
+          size: highlighter ? widths.highlighter : widths.pen,
           hl: highlighter,
         },
       })
     },
-    [addLocal, highlightColor, penColor, penSize],
+    [addLocal, highlightColor, penColor, widths.highlighter, widths.pen],
   )
 
   const capture = (pointerId: number) => {
@@ -644,7 +770,7 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
 
   /** Erase every stroke the eraser passed over between two world points. */
   const eraseAlong = (from: Point, to: Point) => {
-    const radius = ERASER_RADIUS / viewRef.current.zoom
+    const radius = widths.eraser / 2 / viewRef.current.zoom
     let next: Map<string, Shape> | null = null
     for (const shape of allRef.current) {
       if (shape.type !== 'stroke') continue
@@ -677,6 +803,8 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
     for (let i = shapesHere.length - 1; i >= 0; i--) {
       const shape = shapesHere[i]
       if (shape.type === 'stroke') continue
+      // For a student a picture is background, not something to pick up.
+      if (shape.type === 'image' && !isTutor) continue
       const box = measure(shape)
       if (
         point.x >= box.x &&
@@ -690,22 +818,110 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
     return null
   }
 
+  /** Give up the gesture in progress without committing any of it. */
+  const cancelGesture = () => {
+    const active = gesture.current
+    gesture.current = null
+    activePointer.current = null
+    if (!active) return
+    if (active.kind === 'draw') {
+      draft.current = []
+      setDraftTick((tick) => tick + 1)
+    } else if (active.kind === 'move') setDrag(null)
+    else if (active.kind === 'marquee') setMarquee(null)
+    else if (active.kind === 'region') setRegion(null)
+    else if (active.kind === 'erase') moveEraserRing(null)
+    else if (active.kind === 'resize') setResizing(null)
+  }
+
+  /** A second finger has landed: whatever the first was doing becomes a pinch. */
+  const beginPinch = () => {
+    cancelGesture()
+    const [[idA, a], [idB, b]] = [...touches.current]
+    const box = containerRef.current?.getBoundingClientRect()
+    capture(idA)
+    capture(idB)
+    gesture.current = {
+      kind: 'pinch',
+      ids: [idA, idB],
+      mid: { x: (a.x + b.x) / 2 - (box?.left ?? 0), y: (a.y + b.y) / 2 - (box?.top ?? 0) },
+      distance: Math.hypot(a.x - b.x, a.y - b.y),
+      view: viewRef.current,
+    }
+  }
+
   const onPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
     lastPointerType.current = event.pointerType
     const bind = penBind(event)
     if (event.button === 2 && !bind) return
-    const target = event.target as Element
-    if (target.closest('[data-board-ui]')) return
+    if ((event.target as Element).closest('[data-board-ui]')) return
     if (!containerRef.current) return
+
+    if (event.pointerType === 'touch') {
+      // A palm that lands while the pen is writing is not a second finger.
+      const owner = activePointer.current
+      if (gesture.current && owner?.type === 'pen' && performance.now() - owner.at < PEN_IDLE_MS) {
+        return
+      }
+      // The first finger of a touch means no others are down, whatever is remembered.
+      if (event.isPrimary) touches.current.clear()
+      touches.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+      if (touches.current.size === 2) {
+        beginPinch()
+        return
+      }
+      if (touches.current.size > 2) return
+    }
+
+    // One pointer at a time: a new one takes over from whatever was in progress.
+    cancelGesture()
+    beginGesture(event, bind)
+    if (gesture.current) {
+      activePointer.current = { id: event.pointerId, type: event.pointerType, at: performance.now() }
+    }
+  }
+
+  /** Start the gesture for a pointer that has just gone down, if it starts one. */
+  const beginGesture = (event: React.PointerEvent<HTMLDivElement>, bind: ReturnType<typeof penBind>) => {
+    const target = event.target as Element
     const world = toWorld(event.clientX, event.clientY)
 
-    // The pen's eraser end erases ink, whichever tool is selected.
-    if (bind === 'erase') {
+    // The corner handle of the selected picture resizes it.
+    const resizeId = target.closest('[data-resize]')?.getAttribute('data-resize')
+    if (resizeId) {
+      const shape = allRef.current.find((candidate) => candidate.id === resizeId)
+      if (!shape || !canWrite) return
+      capture(event.pointerId)
+      gesture.current = {
+        kind: 'resize',
+        id: resizeId,
+        startX: world.x,
+        startY: world.y,
+        width: shape.width,
+        height: shape.height,
+      }
+      return
+    }
+
+    const panning = !bind && (event.button === 1 || tool === 'pan' || spaceHeld)
+
+    // The eraser tool, or a pen's eraser end under any tool.
+    if (bind === 'erase' || (tool === 'eraser' && !bind && !panning)) {
       if (!canWrite) return
       capture(event.pointerId)
-      gesture.current = { kind: 'erase', x: world.x, y: world.y }
-      moveEraserRing(event)
-      eraseAlong(world, world)
+      const finger = event.pointerType === 'touch'
+      gesture.current = {
+        kind: 'erase',
+        x: world.x,
+        y: world.y,
+        armed: !finger,
+        downX: event.clientX,
+        downY: event.clientY,
+      }
+      if (!finger) {
+        moveEraserRing(event)
+        eraseAlong(world, world)
+      }
       return
     }
 
@@ -716,7 +932,6 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
         ? hitAt(world)
         : (target.closest('[data-shape-id]')?.getAttribute('data-shape-id') ?? null)
 
-    const panning = !bind && (event.button === 1 || tool === 'pan' || spaceHeld)
     if (panning) {
       capture(event.pointerId)
       gesture.current = {
@@ -783,10 +998,34 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
   }
 
   const onPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (touches.current.has(event.pointerId)) {
+      touches.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+    }
+    const active = gesture.current
+
+    if (active?.kind === 'pinch') {
+      const a = touches.current.get(active.ids[0])
+      const b = touches.current.get(active.ids[1])
+      const box = containerRef.current?.getBoundingClientRect()
+      if (!a || !b || !box) return
+      const mid = { x: (a.x + b.x) / 2 - box.left, y: (a.y + b.y) / 2 - box.top }
+      const distance = Math.hypot(a.x - b.x, a.y - b.y)
+      setView(pinchView(active.view, active.mid, active.distance, mid, distance, MIN_ZOOM, MAX_ZOOM))
+      return
+    }
+
     const world = toWorld(event.clientX, event.clientY)
     publishCursor(world)
-    const active = gesture.current
-    if (!active) return
+    if (!active) {
+      // With the eraser selected, its outline follows a mouse or a hovering pen.
+      if (tool === 'eraser' && event.pointerType !== 'touch') {
+        moveEraserRing((event.target as Element).closest('[data-board-ui]') ? null : event)
+      }
+      return
+    }
+    const owner = activePointer.current
+    if (owner && owner.id !== event.pointerId) return
+    if (owner) owner.at = performance.now()
 
     switch (active.kind) {
       case 'pan': {
@@ -798,7 +1037,18 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
         })
         break
       }
+      case 'resize': {
+        // The corner follows the pointer; the height keeps the picture's shape.
+        const width = Math.max(IMAGE_MIN_WIDTH, active.width + (world.x - active.startX))
+        setResizing({ id: active.id, width, height: (width * active.height) / active.width })
+        break
+      }
       case 'erase': {
+        if (!active.armed) {
+          const moved = Math.hypot(event.clientX - active.downX, event.clientY - active.downY)
+          if (moved < TOUCH_ERASE_SLOP) break
+          active.armed = true
+        }
         let from: Point = { x: active.x, y: active.y }
         for (const sample of samplesOf(event)) {
           const to = toWorld(sample.clientX, sample.clientY)
@@ -847,17 +1097,45 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
   }
 
   const onPointerUp = (event: React.PointerEvent<HTMLDivElement>) => {
+    touches.current.delete(event.pointerId)
     const active = gesture.current
-    gesture.current = null
     if (!active) return
     const container = containerRef.current
-    if (container?.hasPointerCapture(event.pointerId)) container.releasePointerCapture(event.pointerId)
+    const release = (pointerId: number) => {
+      if (container?.hasPointerCapture(pointerId)) container.releasePointerCapture(pointerId)
+    }
+
+    if (active.kind === 'pinch') {
+      // Either finger lifting ends the pinch; the one still down does nothing more.
+      if (!active.ids.includes(event.pointerId)) return
+      gesture.current = null
+      active.ids.forEach(release)
+      return
+    }
+
+    const owner = activePointer.current
+    if (owner && owner.id !== event.pointerId) return
+    gesture.current = null
+    activePointer.current = null
+    release(event.pointerId)
     const world = toWorld(event.clientX, event.clientY)
 
     switch (active.kind) {
       case 'erase':
-        moveEraserRing(null)
+        // A finger that tapped without moving erases what it tapped.
+        if (!active.armed && event.type !== 'pointercancel') eraseAlong(world, world)
+        // With the eraser selected, the outline stays under a mouse or pen.
+        if (tool !== 'eraser' || event.pointerType === 'touch') moveEraserRing(null)
         break
+      case 'resize': {
+        setResizing(null)
+        const width = Math.max(IMAGE_MIN_WIDTH, active.width + (world.x - active.startX))
+        if (Math.abs(width - active.width) < 0.5) break
+        const height = (width * active.height) / active.width
+        patchShape(active.id, { width, height })
+        resizeShape(active.id, width, height)
+        break
+      }
       case 'draw':
         if (draft.current.length === 2) draft.current.push(world.x + 0.01, world.y)
         finishStroke(tool === 'highlighter')
@@ -879,7 +1157,13 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
         const box = rectFromPoints(active.startX, active.startY, world.x, world.y)
         setMarquee(null)
         if (box.w < 4 && box.h < 4) break
-        const hits = allRef.current.filter((shape) => rectsOverlap(measure(shape), box))
+        const hits = allRef.current.filter((shape) => {
+          const rect = measure(shape)
+          // A picture is something to write on: the box picks it up only when
+          // it holds the whole picture, so selecting ink on top leaves it be.
+          if (shape.type === 'image') return isTutor && rectContains(box, rect)
+          return rectsOverlap(rect, box)
+        })
         setSelection((prev) => {
           const next = event.shiftKey ? new Set(prev) : new Set<string>()
           for (const shape of hits) next.add(shape.id)
@@ -905,6 +1189,75 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
       case 'pan':
         break
     }
+  }
+
+  // --- Pictures (tutor) ----------------------------------------------------
+
+  const addImage = useCallback(
+    async (file: File, at?: Point) => {
+      if (!onAddImage || !canWrite) return
+      setUploading((count) => count + 1)
+      let uploaded: UploadedImage | null = null
+      try {
+        uploaded = await onAddImage(file)
+      } finally {
+        setUploading((count) => count - 1)
+      }
+      if (!uploaded) return
+
+      // Shown at a comfortable size in the middle of what the tutor is
+      // looking at (or where it was dropped), never larger than its pixels.
+      const box = containerRef.current?.getBoundingClientRect()
+      const v = viewRef.current
+      const viewWidth = (box?.width ?? 900) / v.zoom
+      const viewHeight = (box?.height ?? 600) / v.zoom
+      const fit = Math.min(
+        1,
+        IMAGE_START_WIDTH / uploaded.width,
+        (viewWidth * 0.7) / uploaded.width,
+        (viewHeight * 0.7) / uploaded.height,
+      )
+      const width = uploaded.width * fit
+      const height = uploaded.height * fit
+      const center = at ?? { x: v.x + viewWidth / 2, y: v.y + viewHeight / 2 }
+      const id = crypto.randomUUID()
+      addLocal({
+        id,
+        type: 'image',
+        x: center.x - width / 2,
+        y: center.y - height / 2,
+        width,
+        height,
+        props: { src: uploaded.src },
+      })
+      // Selected, so it can be moved or resized straight away.
+      setTool('select')
+      setSelection(new Set([id]))
+    },
+    [addLocal, canWrite, onAddImage],
+  )
+
+  // A screenshot on the clipboard goes straight onto the board.
+  useEffect(() => {
+    if (!onAddImage) return
+    const onPaste = (event: ClipboardEvent) => {
+      if (isTypingTarget(event.target)) return
+      const files = imageFiles(event.clipboardData)
+      if (!files.length) return
+      event.preventDefault()
+      for (const file of files.slice(0, 4)) void addImage(file)
+    }
+    window.addEventListener('paste', onPaste)
+    return () => window.removeEventListener('paste', onPaste)
+  }, [addImage, onAddImage])
+
+  const onDrop = (event: React.DragEvent<HTMLDivElement>) => {
+    if (!onAddImage) return
+    const files = imageFiles(event.dataTransfer)
+    if (!files.length) return
+    event.preventDefault()
+    const at = toWorld(event.clientX, event.clientY)
+    for (const file of files.slice(0, 4)) void addImage(file, at)
   }
 
   // --- Wheel + keyboard ----------------------------------------------------
@@ -973,8 +1326,9 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
         '3': 'type',
         '4': 'pen',
         '5': 'highlighter',
+        '6': 'eraser',
       }
-      if (isTutor) shortcuts['6'] = 'region'
+      if (isTutor) shortcuts['7'] = 'region'
       const next = shortcuts[event.key]
       if (next) setTool(next)
     }
@@ -997,11 +1351,21 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
     [],
   )
 
+  // The eraser's outline belongs to the eraser tool; put it away with the tool.
+  useEffect(() => {
+    if (tool !== 'eraser' && eraserRing.current) delete eraserRing.current.dataset.on
+  }, [tool])
+
   // --- Region check (tutor) ------------------------------------------------
 
   const runCheck = async () => {
     if (!region || !onCheck || checking) return
-    const capture = captureRegion(region, allRef.current, measure)
+    // Pictures are drawn into the capture from the <img> already on screen.
+    const pictureOf = (shape: Shape) =>
+      containerRef.current?.querySelector<HTMLImageElement>(
+        `[data-shape-id="${CSS.escape(shape.id)}"] img`,
+      ) ?? null
+    const capture = captureRegion(region, allRef.current, measure, pictureOf)
     if (!capture) return
     setChecking(true)
     const posted = await onCheck(capture)
@@ -1023,6 +1387,12 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
   const gridSize = 28 * view.zoom
   const hittable = tool === 'select' || tool === 'type'
   const panCursor = tool === 'pan' || spaceHeld
+  // The one selected picture gets a corner handle to resize it by.
+  const [onlySelected] = selection.size === 1 ? [...selection] : []
+  const resizable =
+    isTutor && tool === 'select' && !panCursor
+      ? images.find((image) => image.id === onlySelected)
+      : undefined
 
   return (
     <div
@@ -1036,7 +1406,15 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerUp}
-      onPointerLeave={() => publishCursor(null)}
+      onPointerLeave={() => {
+        publishCursor(null)
+        if (gesture.current?.kind !== 'erase') moveEraserRing(null)
+      }}
+      // Dropping an image file on the board adds it where it was dropped.
+      onDragOver={(event) => {
+        if (onAddImage && event.dataTransfer.types.includes('Files')) event.preventDefault()
+      }}
+      onDrop={onDrop}
       // A pen's side button and its press-and-hold both ask for a context
       // menu; on a drawing surface that would cover the ink. A mouse keeps it.
       onContextMenu={(event) => {
@@ -1050,6 +1428,11 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
           transform: `translate(${-view.x * view.zoom}px, ${-view.y * view.zoom}px) scale(${view.zoom})`,
         }}
       >
+        <ImageLayer
+          images={images}
+          selected={selection}
+          hittable={isTutor && tool === 'select' && !panCursor}
+        />
         <ItemLayer
           items={items}
           selected={selection}
@@ -1079,7 +1462,7 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
               d={strokePath(draftPoints)}
               fill="none"
               stroke={tool === 'highlighter' ? highlightColor : penColor}
-              strokeWidth={tool === 'highlighter' ? HIGHLIGHTER_SIZE : penSize}
+              strokeWidth={tool === 'highlighter' ? widths.highlighter : widths.pen}
               strokeLinecap="round"
               strokeLinejoin="round"
               opacity={tool === 'highlighter' ? HIGHLIGHTER_OPACITY : 1}
@@ -1089,8 +1472,24 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
       </div>
 
       {/* Screen-space overlays */}
-      <div ref={eraserRing} className="board-eraser" aria-hidden="true" />
+      <div
+        ref={eraserRing}
+        className="board-eraser"
+        aria-hidden="true"
+        style={{ width: widths.eraser, height: widths.eraser, margin: -widths.eraser / 2 }}
+      />
       {marquee && <div className="board-marquee" style={toScreen(marquee)} />}
+      {resizable && (
+        <div
+          className="board-resize"
+          data-resize={resizable.id}
+          title="Drag to resize"
+          style={{
+            left: (resizable.x + resizable.width - view.x) * view.zoom,
+            top: (resizable.y + resizable.height - view.y) * view.zoom,
+          }}
+        />
+      )}
 
       {peers.map((peer) => {
         const peerRegion = peer.state.region as Rect | null | undefined
@@ -1192,12 +1591,43 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
         <ToolButton tool="highlighter" label="Highlighter" hint="5" active={tool} onSelect={setTool}>
           <Highlighter className="size-[18px]" aria-hidden="true" />
         </ToolButton>
+        <ToolButton tool="eraser" label="Eraser" hint="6" active={tool} onSelect={setTool}>
+          <Eraser className="size-[18px]" aria-hidden="true" />
+        </ToolButton>
         {isTutor && (
           <>
             <div className="board-toolbar-rule" />
-            <ToolButton tool="region" label="Check a region with Claude" hint="6" active={tool} onSelect={setTool}>
+            <ToolButton tool="region" label="Check a region with Claude" hint="7" active={tool} onSelect={setTool}>
               <ScanSearch className="size-[18px]" aria-hidden="true" />
             </ToolButton>
+          </>
+        )}
+        {onAddImage && (
+          <>
+            <button
+              type="button"
+              className="board-tool"
+              title="Add a picture (or paste a screenshot)"
+              aria-label="Add a picture"
+              disabled={!canWrite}
+              onClick={() => fileInput.current?.click()}
+            >
+              <ImagePlus className="size-[18px]" aria-hidden="true" />
+            </button>
+            <input
+              ref={fileInput}
+              type="file"
+              accept="image/*"
+              multiple
+              hidden
+              data-testid="image-input"
+              onChange={(event) => {
+                const files = Array.from(event.target.files ?? [])
+                // Cleared so that picking the same file again still fires a change.
+                event.target.value = ''
+                for (const file of files.slice(0, 4)) void addImage(file)
+              }}
+            />
           </>
         )}
         <div className="board-toolbar-rule" />
@@ -1228,24 +1658,19 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
               />
             )
           })}
-          {tool === 'pen' && (
-            <>
-              <div className="board-palette-rule" />
-              {PEN_SIZES.map((size) => (
-                <button
-                  key={size}
-                  type="button"
-                  className={cn('board-size', penSize === size && 'is-active')}
-                  title={`Pen width ${size}`}
-                  aria-label={`Pen width ${size}`}
-                  aria-pressed={penSize === size}
-                  onClick={() => setPenSize(size)}
-                >
-                  <span style={{ width: size + 3, height: size + 3 }} />
-                </button>
-              ))}
-            </>
-          )}
+          <div className="board-palette-rule" />
+          <WidthSlider
+            tool={tool === 'pen' ? 'pen' : 'highlighter'}
+            label={tool === 'pen' ? 'Pen width' : 'Highlighter width'}
+            value={tool === 'pen' ? widths.pen : widths.highlighter}
+            color={tool === 'pen' ? penColor : highlightColor}
+            onChange={setWidth}
+          />
+        </div>
+      )}
+      {tool === 'eraser' && (
+        <div className="board-palette" data-board-ui>
+          <WidthSlider tool="eraser" label="Eraser width" value={widths.eraser} onChange={setWidth} />
         </div>
       )}
 
@@ -1259,9 +1684,14 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
           Drag a box around the question and the answer, then press Check.
         </div>
       )}
+      {tool === 'eraser' && (
+        <div className="board-hint" data-board-ui>
+          Drag over ink to erase it. Undo brings it back.
+        </div>
+      )}
       {selection.size > 0 && tool === 'select' && (
         <div className="board-hint" data-board-ui>
-          {selection.size} selected. Drag to move, Delete to remove.
+          {selection.size} selected. Drag to move, {resizable ? 'drag the corner to resize, ' : ''}Delete to remove.
         </div>
       )}
 
@@ -1282,9 +1712,101 @@ export const Board = forwardRef<BoardHandle, BoardProps>(function Board(
           {connected ? 'View only' : 'Connecting to the board'}
         </div>
       )}
+      {uploading > 0 && connected && canWrite && (
+        <div className="board-status" role="status">
+          <LoaderCircle className="mr-1.5 inline size-3.5 animate-spin align-[-2px]" aria-hidden="true" />
+          Adding the picture
+        </div>
+      )}
     </div>
   )
 })
+
+/**
+ * How wide a tool draws (or erases): a vertical slider with a dot that shows
+ * the size. Built from plain elements so it behaves the same under a mouse, a
+ * finger and a pen; a native range input turned on its side does not.
+ */
+function WidthSlider({
+  tool,
+  label,
+  value,
+  color,
+  onChange,
+}: {
+  tool: WidthTool
+  label: string
+  value: number
+  /** The ink colour, for the pen and highlighter. The eraser shows an outline. */
+  color?: string
+  onChange: (tool: WidthTool, value: number) => void
+}) {
+  const { min, max, step } = WIDTHS[tool]
+  const fraction = (value - min) / (max - min)
+  const set = (next: number) => {
+    const snapped = Math.round(next / step) * step
+    onChange(tool, Math.min(max, Math.max(min, Math.round(snapped * 100) / 100)))
+  }
+  // The top of the track is the widest.
+  const fromPointer = (event: React.PointerEvent<HTMLDivElement>) => {
+    const box = event.currentTarget.getBoundingClientRect()
+    set(min + (1 - (event.clientY - box.top) / box.height) * (max - min))
+  }
+  const dot = Math.min(26, Math.max(2, value))
+
+  return (
+    <div className="board-width">
+      <div className="board-width-preview" aria-hidden="true">
+        <span
+          className={color ? undefined : 'is-outline'}
+          style={{
+            width: dot,
+            height: dot,
+            background: color,
+            opacity: tool === 'highlighter' ? HIGHLIGHTER_OPACITY + 0.25 : undefined,
+          }}
+        />
+      </div>
+      <div
+        className="board-width-track"
+        role="slider"
+        tabIndex={0}
+        aria-label={label}
+        aria-orientation="vertical"
+        aria-valuemin={min}
+        aria-valuemax={max}
+        aria-valuenow={value}
+        title={`${label}: ${value}`}
+        onPointerDown={(event) => {
+          event.currentTarget.setPointerCapture(event.pointerId)
+          fromPointer(event)
+        }}
+        onPointerMove={(event) => {
+          if (event.currentTarget.hasPointerCapture(event.pointerId)) fromPointer(event)
+        }}
+        onKeyDown={(event) => {
+          const steps: Record<string, number> = {
+            ArrowUp: step,
+            ArrowRight: step,
+            ArrowDown: -step,
+            ArrowLeft: -step,
+            PageUp: step * 4,
+            PageDown: -step * 4,
+          }
+          if (event.key === 'Home') set(min)
+          else if (event.key === 'End') set(max)
+          else if (steps[event.key]) set(value + steps[event.key])
+          else return
+          event.preventDefault()
+        }}
+      >
+        <div className="board-width-fill" style={{ height: `${fraction * 100}%` }} />
+        <div className="board-width-thumb" style={{ bottom: `${fraction * 100}%` }} />
+      </div>
+      <output className="board-width-value">{value}</output>
+    </div>
+  )
+}
 
 function ToolButton({
   tool,

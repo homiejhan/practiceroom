@@ -12,7 +12,8 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { AuthOverlay, getUserColor, useAuth } from 'deepspace'
 import { Check, Link2, MessageSquare, PanelLeft } from 'lucide-react'
-import { Board, type BoardHandle, type BoardPeer } from '@/board/Board'
+import { Board, type BoardHandle, type BoardPeer, type UploadedImage } from '@/board/Board'
+import { prepareImage } from '@/board/imageUpload'
 import type { RegionCapture } from '@/board/renderRegion'
 import { RoomChat } from '@/components/room/RoomChat'
 import { TutorPanel } from '@/components/room/TutorPanel'
@@ -230,6 +231,30 @@ function RoomView({ info, me }: { info: RoomInfo; me: Me }) {
     [roomId, toast],
   )
 
+  // A picture is scaled down and re-encoded here in the browser, then stored
+  // by the worker, which checks that the caller is this room's tutor.
+  const onAddImage = useCallback(
+    async (file: File): Promise<UploadedImage | null> => {
+      let prepared: Awaited<ReturnType<typeof prepareImage>>
+      try {
+        prepared = await prepareImage(file)
+      } catch {
+        toast.error('That picture could not be added', 'Use an image file such as a PNG or JPEG screenshot or photo.')
+        return null
+      }
+      const result = await callAction<{ src: string }>('addBoardImage', {
+        roomId,
+        image: prepared.dataUrl,
+      })
+      if (!result.ok) {
+        toast.error('That picture could not be added', result.error)
+        return null
+      }
+      return { src: result.data.src, width: prepared.width, height: prepared.height }
+    },
+    [roomId, toast],
+  )
+
   const copyLink = async () => {
     try {
       await navigator.clipboard.writeText(`${window.location.origin}/r/${roomId}`)
@@ -344,6 +369,7 @@ function RoomView({ info, me }: { info: RoomInfo; me: Me }) {
             ownerId={ownerId}
             isTutor={isOwner}
             onCheck={isOwner ? onCheck : undefined}
+            onAddImage={isOwner ? onAddImage : undefined}
             onPeers={setPeers}
           />
         </main>

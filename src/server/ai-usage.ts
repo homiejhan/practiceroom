@@ -21,10 +21,13 @@ export const DAILY_AI_LIMIT = 80
 /** Recap emails each signed-in user may send per UTC day. */
 export const DAILY_EMAIL_LIMIT = 10
 
+/** Pictures each tutor may put on their boards per UTC day. They are stored in the owner's files. */
+export const DAILY_IMAGE_LIMIT = 60
+
 async function spend(
   env: Env,
   userId: string,
-  bucket: '' | '_email',
+  bucket: '' | '_email' | '_image',
   limit: number,
   refusal: string,
 ): Promise<string | null> {
@@ -61,5 +64,16 @@ export function spendRecapEmail(env: Env, userId: string): Promise<string | null
     '_email',
     DAILY_EMAIL_LIMIT,
     `You have sent today's ${DAILY_EMAIL_LIMIT} recap emails. The limit resets at midnight UTC.`,
+  )
+}
+
+/** Count one board picture for `userId`; same contract as {@link spendAiCall}. */
+export function spendBoardImage(env: Env, userId: string): Promise<string | null> {
+  return spend(
+    env,
+    userId,
+    '_image',
+    DAILY_IMAGE_LIMIT,
+    `You have added today's ${DAILY_IMAGE_LIMIT} pictures. The limit resets at midnight UTC.`,
   )
 }

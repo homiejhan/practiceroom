@@ -24,11 +24,12 @@ import {
   type Difficulty,
   type GeneratedQuestion,
   type QuestionType,
+  type RegionImageType,
   type RegionQuestion,
   type RegionTyped,
 } from '../server/ai.js'
 import { appFiles } from 'deepspace/worker'
-import { spendAiCall, spendRecapEmail } from '../server/ai-usage.js'
+import { spendAiCall, spendBoardImage, spendRecapEmail } from '../server/ai-usage.js'
 import { ROOM_ID_RE } from '../server/guest.js'
 import { recordTools } from '../server/record-tools.js'
 import { buildRecapEmail, buildWorksheetLatex } from '../server/worksheet.js'
@@ -100,7 +101,18 @@ const asCoordinate = (value: unknown): number =>
   typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : 0
 
 const MAX_IMAGE_CHARS = 4_000_000
-const PNG_PREFIX = 'data:image/png;base64,'
+/** A region capture: PNG for ink alone, JPEG when it has a photograph in it. */
+const REGION_IMAGE_RE = /^data:(image\/(?:png|jpeg));base64,/
+
+/** A picture for the board, already scaled down and re-encoded by the browser. */
+const BOARD_IMAGE_RE = /^data:image\/(png|jpeg);base64,/
+const MAX_BOARD_IMAGE_CHARS = 3_000_000
+
+/** Whether the bytes really are the kind of image they were sent as. */
+function looksLike(kind: 'png' | 'jpeg', bytes: Uint8Array): boolean {
+  const starts = (...signature: number[]) => signature.every((byte, i) => bytes[i] === byte)
+  return kind === 'png' ? starts(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a) : starts(0xff, 0xd8, 0xff)
+}
 
 const EMAIL_RE = /^[^\s@<>,;]+@[^\s@<>,;]+\.[^\s@<>,;]+$/
 
@@ -303,6 +315,48 @@ export const actions: Record<string, ActionHandler<Env>> = {
   },
 
   /**
+   * Store a picture for a room's whiteboard and return where it is served.
+   *
+   * Like a worksheet, it goes in the app's files under a random key, which
+   * anyone with the address can read: that is what lets a student with no
+   * account see it. Only the room's tutor can add one, and each tutor has a
+   * daily allowance, because the files are stored at the owner's cost.
+   */
+  addBoardImage: async ({ userId, params, tools, env }) => {
+    const room = await ownedRoom(tools, params.roomId, userId)
+    if (!room) return fail('Only the tutor of this room can add pictures.')
+
+    const image = typeof params.image === 'string' ? params.image : ''
+    const header = BOARD_IMAGE_RE.exec(image)
+    if (!header) return fail('That file is not a picture the board can show.')
+    if (image.length > MAX_BOARD_IMAGE_CHARS) return fail('That picture is too large. Try a smaller one.')
+    const kind = header[1] as 'png' | 'jpeg'
+
+    let bytes: Uint8Array<ArrayBuffer>
+    try {
+      bytes = Uint8Array.from(atob(image.slice(header[0].length)), (ch) => ch.charCodeAt(0))
+    } catch {
+      return fail('That file is not a picture the board can show.')
+    }
+    if (!looksLike(kind, bytes)) return fail('That file is not a picture the board can show.')
+
+    const overLimit = await spendBoardImage(env, userId)
+    if (overLimit) return fail(overLimit)
+
+    const extension = kind === 'png' ? 'png' : 'jpg'
+    try {
+      const file = await appFiles(env, { scope: 'app', userId }).upload(
+        new Blob([bytes], { type: `image/${kind}` }),
+        { key: `boards/${room.roomId}/${crypto.randomUUID()}.${extension}`, name: `picture.${extension}` },
+      )
+      return { success: true, data: { src: file.path } }
+    } catch (error) {
+      console.error(`[board image] upload failed room=${room.roomId}: ${String(error)}`)
+      return fail('The picture could not be saved. Try again.')
+    }
+  },
+
+  /**
    * Grade one region of the whiteboard. The tutor's browser sends an image of
    * the selected rectangle plus the typed entries and question cards inside
    * it; the worker adds the private answer keys, asks Claude, and posts the
@@ -313,13 +367,15 @@ export const actions: Record<string, ActionHandler<Env>> = {
     if (!room) return fail('Only the tutor of this room can check work.')
 
     const image = typeof params.image === 'string' ? params.image : ''
-    if (!image.startsWith(PNG_PREFIX)) return fail('The region image is missing.')
+    const imageHeader = REGION_IMAGE_RE.exec(image)
+    if (!imageHeader) return fail('The region image is missing.')
     if (image.length > MAX_IMAGE_CHARS) return fail('That region is too large to check. Select a smaller area.')
 
     const rawQuestions = Array.isArray(params.questions) ? params.questions.slice(0, 12) : []
     const rawTyped = Array.isArray(params.typed) ? params.typed.slice(0, 60) : []
     const strokeCount = asCoordinate(params.strokeCount)
-    if (!rawQuestions.length && !rawTyped.length && strokeCount <= 0) {
+    const imageCount = asCoordinate(params.imageCount)
+    if (!rawQuestions.length && !rawTyped.length && strokeCount <= 0 && imageCount <= 0) {
       return fail('There is nothing inside that box to check.')
     }
 
@@ -367,7 +423,9 @@ export const actions: Record<string, ActionHandler<Env>> = {
 
     const reply = await callClaude(tools, {
       ...gradingRequest({
-        imageBase64: image.slice(PNG_PREFIX.length),
+        imageBase64: image.slice(imageHeader[0].length),
+        imageType: imageHeader[1] as RegionImageType,
+        imageCount,
         width: asCoordinate(params.width),
         height: asCoordinate(params.height),
         questions,

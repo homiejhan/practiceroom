@@ -311,6 +311,383 @@ test("a pen's eraser end erases and its side button selects, under any tool", as
   await studentContext.close()
 })
 
+/**
+ * Two fingers on a touch screen, as the Pointer Events a tablet sends: each
+ * finger is its own pointer, and only the first one is "primary".
+ */
+async function twoFingers(
+  page: Page,
+  from: [[number, number], [number, number]],
+  to: [[number, number], [number, number]],
+): Promise<void> {
+  await page.getByTestId('board').evaluate(
+    async (board, { from, to }) => {
+      const frame = () => new Promise((resolve) => requestAnimationFrame(resolve))
+      const fire = (type: string, finger: number, point: number[]) =>
+        board.dispatchEvent(
+          new PointerEvent(type, {
+            bubbles: true,
+            cancelable: true,
+            pointerId: 71 + finger,
+            pointerType: 'touch',
+            isPrimary: finger === 0,
+            clientX: point[0],
+            clientY: point[1],
+            button: type === 'pointermove' ? -1 : 0,
+            buttons: type === 'pointerup' ? 0 : 1,
+          }),
+        )
+      fire('pointerdown', 0, from[0])
+      await frame()
+      fire('pointerdown', 1, from[1])
+      const steps = 8
+      for (let i = 1; i <= steps; i++) {
+        await frame()
+        for (const finger of [0, 1]) {
+          fire('pointermove', finger, [
+            from[finger][0] + ((to[finger][0] - from[finger][0]) * i) / steps,
+            from[finger][1] + ((to[finger][1] - from[finger][1]) * i) / steps,
+          ])
+        }
+      }
+      await frame()
+      fire('pointerup', 0, to[0])
+      fire('pointerup', 1, to[1])
+    },
+    { from, to },
+  )
+}
+
+/**
+ * Real touches, sent through the browser's own input pipeline (Chromium's
+ * DevTools protocol) instead of scripted events. This is what exercises
+ * `touch-action`, pointer capture and which finger the browser calls primary.
+ * Each step is the full list of fingers on the screen at that moment.
+ */
+async function realTouches(page: Page, steps: Array<Array<[number, number]>>): Promise<void> {
+  const cdp = await page.context().newCDPSession(page)
+  await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 })
+  let down = 0
+  for (const fingers of steps) {
+    const touchPoints = fingers.map(([x, y], id) => ({ x, y, id }))
+    const type = fingers.length === 0 ? 'touchEnd' : fingers.length > down ? 'touchStart' : 'touchMove'
+    await cdp.send('Input.dispatchTouchEvent', { type, touchPoints })
+    down = fingers.length
+    await page.waitForTimeout(16)
+  }
+  await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: false })
+  await cdp.detach()
+}
+
+test('the eraser tool, adjustable widths and two-finger zoom', async ({ users, browser }) => {
+  test.setTimeout(90_000)
+  const [tutor] = await users(1)
+  const roomPath = await createRoom(tutor.page, 'Eraser and pinch')
+  const studentContext = await browser.newContext()
+  const student = await studentContext.newPage()
+  await joinAsStudent(student, roomPath, 'Maya')
+
+  const page = tutor.page
+  const box = await boardBox(page)
+  const at = (x: number, y: number): [number, number] => [box.x + x, box.y + y]
+  const widthOf = (name: string) => page.getByRole('slider', { name })
+  const strokeWidths = (target: Page) =>
+    inkPaths(target).evaluateAll((paths) => paths.map((path) => path.getAttribute('stroke-width')))
+
+  // Pen width: the keyboard takes it to the widest, a click on the track sets
+  // it by position, and the next stroke is drawn that wide for everyone.
+  await widthOf('Pen width').focus()
+  await page.keyboard.press('End')
+  await expect(widthOf('Pen width')).toHaveAttribute('aria-valuenow', '16')
+  await widthOf('Pen width').click({ position: { x: 13, y: 46 } })
+  await expect(widthOf('Pen width')).toHaveAttribute('aria-valuenow', '8.5')
+  await drawLine(page, ...at(420, 200), ...at(640, 200))
+  await expect.poll(() => strokeWidths(student), { timeout: 10_000 }).toEqual(['8.5'])
+
+  // The highlighter has its own width.
+  await page.keyboard.press('5')
+  await widthOf('Highlighter width').focus()
+  await page.keyboard.press('Home')
+  await drawLine(page, ...at(420, 320), ...at(640, 320))
+  await expect.poll(() => strokeWidths(student), { timeout: 10_000 }).toEqual(['8.5', '8'])
+  await shot(page, 'highlighter-width')
+
+  // The widths are remembered on this device.
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem('practiceroom:widths') ?? '{}'))).toMatchObject({
+    pen: 8.5,
+    highlighter: 8,
+  })
+
+  // The eraser is a tool of its own. Its outline follows the mouse at the
+  // width it is set to, and dragging it over ink removes that ink for everyone.
+  await page.getByRole('button', { name: 'Eraser' }).click()
+  await expect(page.locator('[data-tool="eraser"]')).toHaveAttribute('aria-pressed', 'true')
+  await widthOf('Eraser width').focus()
+  await page.keyboard.press('End')
+  await page.mouse.move(...at(530, 120))
+  const outline = await page.locator('.board-eraser').boundingBox()
+  expect(Math.round(outline!.width)).toBe(80)
+  expect(Math.abs(outline!.x + outline!.width / 2 - (box.x + 530))).toBeLessThan(2)
+  await shot(page, 'eraser-tool')
+
+  await page.mouse.down()
+  await page.mouse.move(...at(530, 240), { steps: 6 })
+  await page.mouse.up()
+  await expect(inkPaths(page)).toHaveCount(1)
+  await expect.poll(() => strokeWidths(student), { timeout: 10_000 }).toEqual(['8'])
+  // Still the eraser afterwards, and undo brings the stroke back.
+  await expect(page.locator('[data-tool="eraser"]')).toHaveAttribute('aria-pressed', 'true')
+  await page.keyboard.press('ControlOrMeta+z')
+  await expect(inkPaths(student)).toHaveCount(2, { timeout: 10_000 })
+
+  // The eraser took 6, so the tutor's check tool is now 7.
+  await page.keyboard.press('7')
+  await expect(page.locator('[data-tool="region"]')).toHaveAttribute('aria-pressed', 'true')
+
+  // Two fingers spreading zoom in around the point between them, whatever
+  // tool is selected, and leave no ink behind. Here the pen is selected.
+  await page.keyboard.press('4')
+  const zoom = page.locator('.board-zoom-value')
+  await expect(zoom).toHaveText('100%')
+  const strokeBox = () => inkPaths(page).first().boundingBox()
+  const before = (await strokeBox())!
+  const center: [number, number] = [before.x + before.width / 2, before.y + before.height / 2]
+  await twoFingers(
+    page,
+    [
+      [center[0] - 50, center[1]],
+      [center[0] + 50, center[1]],
+    ],
+    [
+      [center[0] - 100, center[1]],
+      [center[0] + 100, center[1]],
+    ],
+  )
+  await expect(zoom).toHaveText('200%')
+  const after = (await strokeBox())!
+  expect(after.width / before.width).toBeCloseTo(2, 1)
+  expect(Math.abs(after.x + after.width / 2 - center[0])).toBeLessThan(3)
+  expect(Math.abs(after.y + after.height / 2 - center[1])).toBeLessThan(3)
+  await expect(inkPaths(page)).toHaveCount(2)
+
+  // Sliding both fingers together pans; pinching them in zooms back out.
+  await twoFingers(
+    page,
+    [
+      [center[0] - 100, center[1]],
+      [center[0] + 100, center[1]],
+    ],
+    [
+      [center[0] - 50, center[1] + 60],
+      [center[0] + 50, center[1] + 60],
+    ],
+  )
+  await expect(zoom).toHaveText('100%')
+  const moved = (await strokeBox())!
+  expect(Math.abs(moved.y + moved.height / 2 - (center[1] + 60))).toBeLessThan(3)
+  await expect(inkPaths(page)).toHaveCount(2)
+
+  // The same with real touches. The first finger lands alone, as it does on
+  // a tablet, and would start a pen stroke; the second turns it into a pinch.
+  const spot = at(700, 420)
+  const spread = (gap: number): Array<[number, number]> => [
+    [spot[0] - gap, spot[1]],
+    [spot[0] + gap, spot[1]],
+  ]
+  await realTouches(page, [
+    [[spot[0] - 40, spot[1]]],
+    spread(40),
+    spread(50),
+    spread(60),
+    spread(70),
+    spread(80),
+    [],
+  ])
+  await expect(zoom).toHaveText('200%')
+  await expect(inkPaths(page)).toHaveCount(2)
+
+  // One finger still draws with the pen, as before.
+  await realTouches(page, [[[spot[0], spot[1]]], [[spot[0] + 40, spot[1] + 10]], [[spot[0] + 90, spot[1]]], []])
+  await expect(inkPaths(page)).toHaveCount(3)
+  await expect(inkPaths(student)).toHaveCount(3, { timeout: 10_000 })
+
+  await studentContext.close()
+})
+
+test('a picture on the board: upload, paste, share, resize and grade', async ({ users, browser }) => {
+  test.setTimeout(120_000)
+  const [tutor] = await users(1)
+  const roomPath = await createRoom(tutor.page, 'Homework photo')
+  const roomId = roomPath.split('/').pop()
+  const studentContext = await browser.newContext()
+  const student = await studentContext.newPage()
+  await joinAsStudent(student, roomPath, 'Maya')
+  const page = tutor.page
+
+  // A stand-in for a screenshot of a homework problem: 600 x 400, white, with
+  // the problem as text and a dark bar under it.
+  const pngBase64 = await page.evaluate(() => {
+    const canvas = document.createElement('canvas')
+    canvas.width = 600
+    canvas.height = 400
+    const ctx = canvas.getContext('2d')!
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, 600, 400)
+    ctx.fillStyle = '#1b1c1f'
+    ctx.font = '600 40px Helvetica, Arial, sans-serif'
+    ctx.fillText('Solve for x:', 40, 80)
+    ctx.fillText('3x + 5 = 20', 40, 150)
+    ctx.fillRect(40, 190, 520, 24)
+    return canvas.toDataURL('image/png').split(',')[1]
+  })
+
+  // Only the tutor can add one, in the interface and on the server.
+  await expect(student.getByRole('button', { name: 'Add a picture' })).toHaveCount(0)
+  const refused = await student.request.post('/api/actions/addBoardImage', {
+    data: { roomId, image: `data:image/png;base64,${pngBase64}` },
+  })
+  expect(refused.status()).toBe(401)
+
+  await page.getByTestId('image-input').setInputFiles({
+    name: 'homework.png',
+    mimeType: 'image/png',
+    buffer: Buffer.from(pngBase64, 'base64'),
+  })
+  const tutorPicture = page.locator('.board-image img')
+  const studentPicture = student.locator('.board-image img')
+  await expect(tutorPicture).toHaveCount(1, { timeout: 30_000 })
+  await expect(studentPicture).toHaveCount(1, { timeout: 15_000 })
+
+  // It is stored with this app and loads for the student, who has no account.
+  expect(await studentPicture.getAttribute('src')).toMatch(/^\/api\/files\/[^?]+\.png(\?|$)/)
+  await expect
+    .poll(() => studentPicture.evaluate((img: HTMLImageElement) => (img.complete ? img.naturalWidth : 0)), {
+      timeout: 15_000,
+    })
+    .toBe(600)
+
+  // It arrives selected, with a corner to resize it by; the shape is kept.
+  await expect(page.locator('[data-tool="select"]')).toHaveAttribute('aria-pressed', 'true')
+  const handle = (await page.locator('.board-resize').boundingBox())!
+  const sizeBefore = (await studentPicture.boundingBox())!
+  await page.mouse.move(handle.x + handle.width / 2, handle.y + handle.height / 2)
+  await page.mouse.down()
+  await page.mouse.move(handle.x + handle.width / 2 + 60, handle.y + handle.height / 2 + 10, { steps: 5 })
+  await page.mouse.up()
+  await expect
+    .poll(async () => Math.round((await studentPicture.boundingBox())!.width), { timeout: 10_000 })
+    .toBe(Math.round(sizeBefore.width + 60))
+  const sizeAfter = (await studentPicture.boundingBox())!
+  expect(sizeAfter.width / sizeAfter.height).toBeCloseTo(600 / 400, 1)
+  expect(Math.round((await tutorPicture.boundingBox())!.width)).toBe(Math.round(sizeAfter.width))
+
+  // Ink goes on top of it, and the student can write on it too.
+  const picture = (await tutorPicture.boundingBox())!
+  await page.keyboard.press('4')
+  await drawLine(page, picture.x + 60, picture.y + 200, picture.x + 260, picture.y + 200)
+  await expect(inkPaths(student)).toHaveCount(1, { timeout: 10_000 })
+  const studentSide = (await studentPicture.boundingBox())!
+  await drawLine(student, studentSide.x + 60, studentSide.y + 260, studentSide.x + 260, studentSide.y + 260)
+  await expect(inkPaths(page)).toHaveCount(2, { timeout: 10_000 })
+  await shot(page, 'pictures-annotated')
+
+  // For the student the picture is background: dragging across it selects
+  // their ink and leaves the picture where it is.
+  await student.keyboard.press('2')
+  await student.mouse.move(studentSide.x + 30, studentSide.y + 230)
+  await student.mouse.down()
+  await student.mouse.move(studentSide.x + 300, studentSide.y + 290, { steps: 5 })
+  await student.mouse.up()
+  await expect(student.getByText('1 selected')).toBeVisible()
+  expect(Math.round((await studentPicture.boundingBox())!.x)).toBe(Math.round(studentSide.x))
+
+  // The tutor's box picks the picture up only when it holds all of it, so
+  // selecting ink that overlaps it leaves the picture out.
+  await page.keyboard.press('2')
+  await page.mouse.move(picture.x - 30, picture.y + 170)
+  await page.mouse.down()
+  await page.mouse.move(picture.x + 300, picture.y + 230, { steps: 5 })
+  await page.mouse.up()
+  await expect(page.getByText('1 selected')).toBeVisible()
+
+  // Checking a region sends the picture too, under the ink, as a JPEG.
+  let sent: { image?: string; imageCount?: number; strokeCount?: number } = {}
+  await page.route('**/api/actions/checkRegion', async (route) => {
+    sent = route.request().postDataJSON()
+    await route.fulfill({ json: { success: true, data: { messageId: 'not-sent-to-claude' } } })
+  })
+  await page.getByRole('button', { name: 'Check a region with Claude' }).click()
+  await page.mouse.move(picture.x - 12, picture.y - 12)
+  await page.mouse.down()
+  await page.mouse.move(picture.x + picture.width + 12, picture.y + picture.height + 12, { steps: 6 })
+  await page.mouse.up()
+  await page.getByRole('button', { name: 'Check', exact: true }).click()
+  await expect.poll(() => sent.imageCount).toBe(1)
+  expect(sent.strokeCount).toBe(2)
+  expect(sent.image).toMatch(/^data:image\/jpeg;base64,/)
+  // The capture really has the picture in it: its dark bars are there.
+  const darkPixels = await page.evaluate(async (dataUrl) => {
+    const image = new Image()
+    image.src = dataUrl
+    await image.decode()
+    const canvas = document.createElement('canvas')
+    canvas.width = image.naturalWidth
+    canvas.height = image.naturalHeight
+    const ctx = canvas.getContext('2d')!
+    ctx.drawImage(image, 0, 0)
+    const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height)
+    let dark = 0
+    for (let i = 0; i < data.length; i += 4) if (data[i] < 80 && data[i + 1] < 80 && data[i + 2] < 80) dark++
+    return dark / (canvas.width * canvas.height)
+  }, sent.image!)
+  expect(darkPixels).toBeGreaterThan(0.03)
+  await page.unroute('**/api/actions/checkRegion')
+
+  // With billed calls allowed, do it for real: the student types an answer on
+  // the photographed problem, and Claude reads the problem from the picture.
+  if (process.env.RUN_AI_TESTS === '1') {
+    await student.keyboard.press('3')
+    await student.mouse.click(studentSide.x + 80, studentSide.y + studentSide.height - 40)
+    await expect(student.locator('math-field')).toBeFocused()
+    await student.keyboard.type('x=5')
+    await student.keyboard.press('Enter')
+    await expect(page.locator('.board-math')).toHaveCount(1, { timeout: 10_000 })
+
+    await page.getByRole('button', { name: 'Check a region with Claude' }).click()
+    await page.mouse.move(picture.x - 12, picture.y - 12)
+    await page.mouse.down()
+    await page.mouse.move(picture.x + picture.width + 12, picture.y + picture.height + 12, { steps: 6 })
+    await page.mouse.up()
+    await page.getByRole('button', { name: 'Check', exact: true }).click()
+    const grade = page.getByTestId('grade-message')
+    await expect(grade).toBeVisible({ timeout: 150_000 })
+    await expect(grade).toContainText(/:\s*Correct/)
+    await shot(page, 'pictures-graded')
+    await page.getByTestId('chat-toggle').click()
+  }
+
+  // A screenshot on the clipboard pastes straight onto the board.
+  await page.evaluate((base64) => {
+    const bytes = Uint8Array.from(atob(base64), (ch) => ch.charCodeAt(0))
+    const clipboard = new DataTransfer()
+    clipboard.items.add(new File([bytes], 'screenshot.png', { type: 'image/png' }))
+    window.dispatchEvent(new ClipboardEvent('paste', { clipboardData: clipboard, bubbles: true, cancelable: true }))
+  }, pngBase64)
+  await expect(studentPicture).toHaveCount(2, { timeout: 30_000 })
+  await expect
+    .poll(() => tutorPicture.evaluateAll((all) => all.every((img) => (img as HTMLImageElement).complete)))
+    .toBe(true)
+  await shot(page, 'pictures-pasted')
+
+  // The pasted picture is selected; Delete removes it for everyone, and undo restores it.
+  await page.keyboard.press('Delete')
+  await expect(studentPicture).toHaveCount(1, { timeout: 10_000 })
+  await page.keyboard.press('ControlOrMeta+z')
+  await expect(studentPicture).toHaveCount(2, { timeout: 10_000 })
+
+  await studentContext.close()
+})
+
 test('graphs, figures and tables written in text are drawn for everyone', async ({ users, browser }) => {
   test.setTimeout(90_000)
   const [tutor] = await users(1)
